@@ -29,7 +29,9 @@ const DEFAULT_SETTINGS = {
   ghDir: 'chats',
 };
 
-const MODELS = ['deepseek-flash', 'deepseek-chat', 'deepseek-reasoner'];
+function normalizeModel(model) {
+  return model === 'deepseek-reasoner' ? 'deepseek-reasoner' : 'deepseek-flash';
+}
 
 const state = {
   settings: readSettings(),
@@ -44,11 +46,9 @@ const state = {
   pinBottom: true,
   themePref: localStorage.getItem(LS.theme) || 'auto',
   searchOn: false,
-  lastPlainModel: 'deepseek-flash',
 };
 
-state.model = MODELS.indexOf(state.settings.model) >= 0 ? state.settings.model : DEFAULT_SETTINGS.model;
-if (state.model !== 'deepseek-reasoner') state.lastPlainModel = state.model;
+state.model = normalizeModel(state.settings.model);
 state.searchOn = false;
 
 /* ============================================================
@@ -264,7 +264,7 @@ async function generateTitle(messages) {
     .join('\n')
     .slice(0, 2400);
 
-  const model = state.model === 'deepseek-reasoner' ? 'deepseek-flash' : state.model;
+  const model = 'deepseek-flash';
   const res = await fetch(apiUrl('/chat/completions'), {
     method: 'POST',
     headers: {
@@ -746,7 +746,7 @@ function restoreDraft() {
   if (!d || !Array.isArray(d.messages) || !d.messages.length) return false;
   if (Date.now() - (d.at || 0) > 1000 * 60 * 60 * 24 * 30) return false;
   state.messages = d.messages;
-  if (MODELS.indexOf(d.model) >= 0) state.model = d.model;
+  if (d.model) state.model = normalizeModel(d.model);
   state.current = Object.assign({ path: '', sha: '', title: '', createdAt: 0, savedHash: '' }, d.current || {});
   return true;
 }
@@ -899,7 +899,6 @@ function appendNode(node) {
  * ============================================================ */
 
 function syncToggles() {
-  $('#modelSelect').value = state.model;
   $('#btnThink').classList.toggle('active', state.model === 'deepseek-reasoner');
   $('#btnThink').setAttribute('aria-pressed', state.model === 'deepseek-reasoner' ? 'true' : 'false');
   $('#btnSearch').classList.toggle('active', state.searchOn);
@@ -907,17 +906,12 @@ function syncToggles() {
 }
 
 function setModel(model) {
-  const next = MODELS.indexOf(model) >= 0 ? model : DEFAULT_SETTINGS.model;
-  if (next !== 'deepseek-reasoner') state.lastPlainModel = next;
-  state.model = next;
-  state.settings.model = next;
-  persistSettings();
+  state.model = normalizeModel(model);
   syncToggles();
 }
 
 function toggleThink() {
-  if (state.model === 'deepseek-reasoner') setModel(state.lastPlainModel || 'deepseek-flash');
-  else setModel('deepseek-reasoner');
+  setModel(state.model === 'deepseek-reasoner' ? 'deepseek-flash' : 'deepseek-reasoner');
 }
 
 function toggleSearch() {
@@ -1207,7 +1201,7 @@ function resetChat() {
   state.sid += 1;
   state.messages = [];
   state.searchOn = false;
-  if (state.model === 'deepseek-reasoner') setModel(state.lastPlainModel || DEFAULT_SETTINGS.model);
+  if (state.model === 'deepseek-reasoner') setModel('deepseek-flash');
   syncToggles();
   state.current = { path: '', sha: '', title: '', createdAt: 0, savedHash: '' };
   localStorage.removeItem(LS.draft);
@@ -1241,7 +1235,7 @@ async function openConv(item) {
     state.messages = Array.isArray(data.messages)
       ? data.messages.map((m) => Object.assign({}, m, { time: m.time ? new Date(m.time).getTime() : item.time }))
       : [];
-    if (MODELS.indexOf(data.model) >= 0) state.model = data.model;
+    if (data.model) state.model = normalizeModel(data.model);
     state.current = {
       path: item.path,
       sha: file.sha,
@@ -1286,7 +1280,6 @@ function openSettings(firstRun) {
   const s = state.settings;
   $('#setApiKey').value = s.apiKey || '';
   $('#setApiBase').value = s.apiBase || DEFAULT_SETTINGS.apiBase;
-  $('#setModel').value = MODELS.indexOf(s.model) >= 0 ? s.model : DEFAULT_SETTINGS.model;
   $('#setGhToken').value = s.ghToken || '';
   $('#setGhOwner').value = s.ghOwner || '';
   $('#setGhRepo').value = s.ghRepo || '';
@@ -1308,15 +1301,13 @@ function collectSettings() {
   state.settings = {
     apiKey: $('#setApiKey').value.trim(),
     apiBase: $('#setApiBase').value.trim() || DEFAULT_SETTINGS.apiBase,
-    model: $('#setModel').value,
+    model: DEFAULT_SETTINGS.model,
     ghToken: $('#setGhToken').value.trim(),
     ghOwner: $('#setGhOwner').value.trim(),
     ghRepo: $('#setGhRepo').value.trim(),
     ghBranch: $('#setGhBranch').value.trim() || 'main',
     ghDir: $('#setGhDir').value.trim().replace(/^\/+|\/+$/g, ''),
   };
-  state.model = MODELS.indexOf(state.settings.model) >= 0 ? state.settings.model : DEFAULT_SETTINGS.model;
-  if (state.model !== 'deepseek-reasoner') state.lastPlainModel = state.model;
   persistSettings();
   applyTheme($('#setTheme').value);
   syncToggles();
@@ -1417,7 +1408,6 @@ function bind() {
     send();
   });
 
-  $('#modelSelect').addEventListener('change', (ev) => setModel(ev.target.value));
 
   $('#chat').addEventListener('scroll', () => {
     const chat = $('#chat');
