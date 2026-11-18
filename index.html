@@ -69,6 +69,14 @@
       <div class="composer-inner">
         <div class="input-card">
           <textarea id="input" rows="1" placeholder="给 DeepSeek 发送消息" enterkeyhint="send"></textarea>
+          <div class="effort-row" id="effortRow" hidden>
+            <span class="effort-label">思考强度</span>
+            <div class="seg" id="effortSeg" role="group" aria-label="思考强度">
+              <button class="seg-btn" type="button" data-effort="low">Low</button>
+              <button class="seg-btn active" type="button" data-effort="high">High</button>
+              <button class="seg-btn" type="button" data-effort="max">Max</button>
+            </div>
+          </div>
           <div class="card-row">
             <div class="toggles">
               <button class="toggle" id="btnThink" type="button" title="使用 DeepSeek-R1 深度思考">

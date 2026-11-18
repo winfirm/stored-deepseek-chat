@@ -29,9 +29,7 @@ const DEFAULT_SETTINGS = {
   ghDir: 'chats',
 };
 
-function normalizeModel(model) {
-  return model === 'deepseek-reasoner' ? 'deepseek-reasoner' : 'deepseek-flash';
-}
+const EFFORTS = ['low', 'high', 'max'];
 
 const state = {
   settings: readSettings(),
@@ -46,10 +44,11 @@ const state = {
   pinBottom: true,
   themePref: localStorage.getItem(LS.theme) || 'auto',
   searchOn: false,
+  thinking: false,
+  effort: 'high',
 };
 
-state.model = normalizeModel(state.settings.model);
-state.searchOn = false;
+state.model = DEFAULT_SETTINGS.model;
 
 /* ============================================================
  * 基础工具
@@ -210,8 +209,10 @@ async function streamChat(messages, opts) {
     messages,
     stream: true,
     stream_options: { include_usage: true },
+    thinking: { type: state.thinking ? 'enabled' : 'disabled' },
   };
-  if (state.model !== 'deepseek-reasoner') body.temperature = 1;
+  if (state.thinking) body.reasoning_effort = state.effort;
+  else body.temperature = 1;
 
   const res = await fetch(apiUrl('/chat/completions'), {
     method: 'POST',
@@ -274,6 +275,7 @@ async function generateTitle(messages) {
     body: JSON.stringify({
       model,
       stream: false,
+      thinking: { type: 'disabled' },
       temperature: 0.3,
       max_tokens: 40,
       messages: [
@@ -652,6 +654,8 @@ async function doSave() {
       id: path,
       title,
       model: state.model,
+      thinking: state.thinking,
+      effort: state.effort,
       createdAt: new Date(createdAt).toISOString(),
       updatedAt: new Date().toISOString(),
       messages: state.messages
@@ -735,6 +739,8 @@ function persistDraft() {
       at: Date.now(),
       model: state.model,
       search: state.searchOn,
+      thinking: state.thinking,
+      effort: state.effort,
       current: state.current,
       messages: state.messages,
     }));
@@ -746,7 +752,8 @@ function restoreDraft() {
   if (!d || !Array.isArray(d.messages) || !d.messages.length) return false;
   if (Date.now() - (d.at || 0) > 1000 * 60 * 60 * 24 * 30) return false;
   state.messages = d.messages;
-  if (d.model) state.model = normalizeModel(d.model);
+  state.thinking = Boolean(d.thinking) || d.model === 'deepseek-reasoner';
+  if (EFFORTS.indexOf(d.effort) >= 0) state.effort = d.effort;
   state.current = Object.assign({ path: '', sha: '', title: '', createdAt: 0, savedHash: '' }, d.current || {});
   return true;
 }
@@ -899,19 +906,27 @@ function appendNode(node) {
  * ============================================================ */
 
 function syncToggles() {
-  $('#btnThink').classList.toggle('active', state.model === 'deepseek-reasoner');
-  $('#btnThink').setAttribute('aria-pressed', state.model === 'deepseek-reasoner' ? 'true' : 'false');
+  $('#btnThink').classList.toggle('active', state.thinking);
+  $('#btnThink').setAttribute('aria-pressed', state.thinking ? 'true' : 'false');
   $('#btnSearch').classList.toggle('active', state.searchOn);
   $('#btnSearch').setAttribute('aria-pressed', state.searchOn ? 'true' : 'false');
+  const row = $('#effortRow');
+  if (row) row.hidden = !state.thinking;
+  $$('#effortSeg .seg-btn').forEach((b) => {
+    b.classList.toggle('active', b.dataset.effort === state.effort);
+  });
 }
 
-function setModel(model) {
-  state.model = normalizeModel(model);
+function setEffort(effort) {
+  state.effort = EFFORTS.indexOf(effort) >= 0 ? effort : 'high';
   syncToggles();
+  persistDraft();
 }
 
 function toggleThink() {
-  setModel(state.model === 'deepseek-reasoner' ? 'deepseek-flash' : 'deepseek-reasoner');
+  state.thinking = !state.thinking;
+  syncToggles();
+  persistDraft();
 }
 
 function toggleSearch() {
@@ -1201,7 +1216,7 @@ function resetChat() {
   state.sid += 1;
   state.messages = [];
   state.searchOn = false;
-  if (state.model === 'deepseek-reasoner') setModel('deepseek-flash');
+  state.thinking = false;
   syncToggles();
   state.current = { path: '', sha: '', title: '', createdAt: 0, savedHash: '' };
   localStorage.removeItem(LS.draft);
@@ -1235,7 +1250,8 @@ async function openConv(item) {
     state.messages = Array.isArray(data.messages)
       ? data.messages.map((m) => Object.assign({}, m, { time: m.time ? new Date(m.time).getTime() : item.time }))
       : [];
-    if (data.model) state.model = normalizeModel(data.model);
+    state.thinking = Boolean(data.thinking) || data.model === 'deepseek-reasoner';
+    state.effort = EFFORTS.indexOf(data.effort) >= 0 ? data.effort : 'high';
     state.current = {
       path: item.path,
       sha: file.sha,
@@ -1393,6 +1409,9 @@ function bind() {
 
   $('#btnThink').addEventListener('click', toggleThink);
   $('#btnSearch').addEventListener('click', toggleSearch);
+  $$('#effortSeg .seg-btn').forEach((b) => {
+    b.addEventListener('click', () => setEffort(b.dataset.effort));
+  });
 
   $('#btnSend').addEventListener('click', () => {
     if (state.streaming) stopStream();

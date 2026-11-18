@@ -5,8 +5,8 @@
 ## 功能
 
 - 参考 DeepSeek 官方 chat-demo 的界面：桌面常驻侧边栏（可收起）、移动端抽屉、居中的对话栏、卡片式输入框
-- 输入框内只有 `DeepThink` / `Search` 两个开关：默认用 `deepseek-flash`，开启 DeepThink 自动切换 `deepseek-reasoner`
-- **DeepThink**：一键切换到 `deepseek-reasoner`，思考过程实时展开、结束后折叠并显示耗时
+- 输入框内只有 `DeepThink` / `Search` 两个开关，模型固定 `deepseek-flash`
+- **DeepThink**：通过 `thinking: { type: "enabled" }` 开启思考，并可选择 `reasoning_effort`：Low / High / Max（默认 High）；思考过程实时展开、结束后折叠并显示耗时
 - **Search**：先联网检索再把网页摘要作为上下文交给模型，回答带 [1] 引用，消息上方可展开查看来源
 - 搜索走 DeepSeek 官方接口 `POST /v1/tools/search`，与聊天共用一个 API Key
 - 标题总结固定使用轻量模型，不占用 R1 的思考开销
