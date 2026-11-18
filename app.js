@@ -948,6 +948,8 @@ function setEffort(effort) {
 
 function toggleThink() {
   state.thinking = !state.thinking;
+  if (state.thinking) state.effort = 'high';
+  else closeEffortMenu();
   syncToggles();
   persistDraft();
 }
@@ -1240,6 +1242,7 @@ function resetChat() {
   state.messages = [];
   state.searchOn = false;
   state.thinking = false;
+  state.effort = 'high';
   syncToggles();
   state.current = { path: '', sha: '', title: '', createdAt: 0, savedHash: '' };
   localStorage.removeItem(LS.draft);
