@@ -68,21 +68,24 @@
     <div class="composer" id="composer">
       <div class="composer-inner">
         <div class="input-card">
-          <textarea id="input" rows="1" placeholder="给 DeepSeek 发送消息" enterkeyhint="send"></textarea>
-          <div class="effort-row" id="effortRow" hidden>
-            <span class="effort-label">思考强度</span>
-            <div class="seg" id="effortSeg" role="group" aria-label="思考强度">
-              <button class="seg-btn" type="button" data-effort="low">Low</button>
-              <button class="seg-btn active" type="button" data-effort="high">High</button>
-              <button class="seg-btn" type="button" data-effort="max">Max</button>
-            </div>
-          </div>
+          <textarea id="input" rows="2" placeholder="给 DeepSeek 发送消息" enterkeyhint="send"></textarea>
           <div class="card-row">
             <div class="toggles">
-              <button class="toggle" id="btnThink" type="button" title="使用 DeepSeek-R1 深度思考">
+              <button class="toggle" id="btnThink" type="button" title="开启深度思考">
                 <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M11 3.5 12.6 8 17 9.6 12.6 11.2 11 15.7 9.4 11.2 5 9.6 9.4 8 11 3.5Z"/><path d="M17.8 15.2l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8.8-2Z"/></svg>
                 DeepThink
               </button>
+              <span class="effort-wrap">
+                <button class="effort-chip" id="btnEffort" type="button" hidden aria-haspopup="true" aria-expanded="false" title="思考强度">
+                  <span id="effortLabel">High</span>
+                  <svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 15 6-6 6 6"/></svg>
+                </button>
+                <div class="effort-menu" id="effortMenu" hidden role="menu" aria-label="思考强度">
+                  <button type="button" data-effort="low" role="menuitem">Low</button>
+                  <button type="button" data-effort="high" role="menuitem">High</button>
+                  <button type="button" data-effort="max" role="menuitem">Max</button>
+                </div>
+              </span>
               <button class="toggle" id="btnSearch" type="button" title="联网搜索后再回答">
                 <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></svg>
                 Search

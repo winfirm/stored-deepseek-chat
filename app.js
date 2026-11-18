@@ -910,16 +910,39 @@ function syncToggles() {
   $('#btnThink').setAttribute('aria-pressed', state.thinking ? 'true' : 'false');
   $('#btnSearch').classList.toggle('active', state.searchOn);
   $('#btnSearch').setAttribute('aria-pressed', state.searchOn ? 'true' : 'false');
-  const row = $('#effortRow');
-  if (row) row.hidden = !state.thinking;
-  $$('#effortSeg .seg-btn').forEach((b) => {
+  const chip = $('#btnEffort');
+  if (chip) chip.hidden = !state.thinking;
+  const label = $('#effortLabel');
+  if (label) label.textContent = state.effort === 'low' ? 'Low' : (state.effort === 'max' ? 'Max' : 'High');
+  $$('#effortMenu button').forEach((b) => {
     b.classList.toggle('active', b.dataset.effort === state.effort);
   });
+  if (!state.thinking) closeEffortMenu();
+}
+
+function closeEffortMenu() {
+  const menu = $('#effortMenu');
+  if (!menu || menu.hidden) return;
+  menu.hidden = true;
+  const chip = $('#btnEffort');
+  if (chip) chip.setAttribute('aria-expanded', 'false');
+}
+
+function toggleEffortMenu() {
+  const menu = $('#effortMenu');
+  if (!menu) return;
+  if (menu.hidden) {
+    menu.hidden = false;
+    $('#btnEffort').setAttribute('aria-expanded', 'true');
+  } else {
+    closeEffortMenu();
+  }
 }
 
 function setEffort(effort) {
   state.effort = EFFORTS.indexOf(effort) >= 0 ? effort : 'high';
   syncToggles();
+  closeEffortMenu();
   persistDraft();
 }
 
@@ -1409,8 +1432,15 @@ function bind() {
 
   $('#btnThink').addEventListener('click', toggleThink);
   $('#btnSearch').addEventListener('click', toggleSearch);
-  $$('#effortSeg .seg-btn').forEach((b) => {
-    b.addEventListener('click', () => setEffort(b.dataset.effort));
+  $('#btnEffort').addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    toggleEffortMenu();
+  });
+  $$('#effortMenu button').forEach((b) => {
+    b.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      setEffort(b.dataset.effort);
+    });
   });
 
   $('#btnSend').addEventListener('click', () => {
@@ -1433,10 +1463,15 @@ function bind() {
     state.pinBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 90;
   });
 
+  document.addEventListener('click', (ev) => {
+    if (!ev.target.closest || !ev.target.closest('.effort-wrap')) closeEffortMenu();
+  });
+
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') {
       closeSettings();
       closeSidebar();
+      closeEffortMenu();
     }
   });
 
