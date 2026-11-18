@@ -5,7 +5,8 @@
 ## 功能
 
 - 仿 DeepSeek App 的界面：左侧抽屉式历史记录、底部输入框、思考过程折叠、代码块复制
-- 支持 `deepseek-chat` / `deepseek-reasoner`（R1 的思考过程单独展示）
+- 模型可在输入框下方随时切换：`deepseek-flash`（默认）、`deepseek-chat`、`deepseek-reasoner`（R1 的思考过程单独展示）
+- 标题总结固定使用轻量模型，不占用 R1 的思考开销
 - SSE 流式输出，可中途停止、可重新生成
 - 每轮对话结束后自动保存：
   1. 调用模型总结不超过 12 字的标题

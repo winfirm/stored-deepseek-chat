@@ -19,7 +19,7 @@ const LS = {
 const DEFAULT_SETTINGS = {
   apiKey: '',
   apiBase: 'https://api.deepseek.com',
-  model: 'deepseek-chat',
+  model: 'deepseek-flash',
   ghToken: '',
   ghOwner: '',
   ghRepo: '',
@@ -41,7 +41,8 @@ const state = {
   themePref: localStorage.getItem(LS.theme) || 'auto',
 };
 
-state.model = state.settings.model || 'deepseek-chat';
+const MODELS = ['deepseek-flash', 'deepseek-chat', 'deepseek-reasoner'];
+state.model = MODELS.indexOf(state.settings.model) >= 0 ? state.settings.model : DEFAULT_SETTINGS.model;
 
 /* ============================================================
  * 基础工具
@@ -256,7 +257,7 @@ async function generateTitle(messages) {
     .join('\n')
     .slice(0, 2400);
 
-  const model = state.model === 'deepseek-reasoner' ? 'deepseek-chat' : state.model;
+  const model = state.model === 'deepseek-reasoner' ? 'deepseek-flash' : state.model;
   const res = await fetch(apiUrl('/chat/completions'), {
     method: 'POST',
     headers: {
@@ -1059,7 +1060,7 @@ async function openConv(item) {
     state.messages = Array.isArray(data.messages)
       ? data.messages.map((m) => Object.assign({}, m, { time: m.time ? new Date(m.time).getTime() : item.time }))
       : [];
-    state.model = data.model || state.model;
+    state.model = MODELS.indexOf(data.model) >= 0 ? data.model : state.model;
     state.current = {
       path: item.path,
       sha: file.sha,
