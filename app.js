@@ -3,6 +3,7 @@
 /* ============================================================
  * DeepSeek Chat · 纯前端 H5
  * - 对话直连 DeepSeek API（浏览器 SSE 流式）
+ * - DeepThink 切换 R1，Search 先联网检索再回答
  * - 记录保存到 GitHub 仓库（git tree 取列表 + contents 读写）
  * ============================================================ */
 
@@ -14,6 +15,8 @@ const LS = {
   list: 'dsc.list',
   draft: 'dsc.draft',
   theme: 'dsc.theme',
+  toggles: 'dsc.toggles',
+  collapsed: 'dsc.collapsed',
 };
 
 const DEFAULT_SETTINGS = {
@@ -25,7 +28,11 @@ const DEFAULT_SETTINGS = {
   ghRepo: '',
   ghBranch: 'main',
   ghDir: 'chats',
+  searchProvider: 'builtin',
+  searchKey: '',
 };
+
+const MODELS = ['deepseek-flash', 'deepseek-chat', 'deepseek-reasoner'];
 
 const state = {
   settings: readSettings(),
@@ -39,10 +46,13 @@ const state = {
   saveChain: Promise.resolve(),
   pinBottom: true,
   themePref: localStorage.getItem(LS.theme) || 'auto',
+  searchOn: false,
+  lastPlainModel: 'deepseek-flash',
 };
 
-const MODELS = ['deepseek-flash', 'deepseek-chat', 'deepseek-reasoner'];
 state.model = MODELS.indexOf(state.settings.model) >= 0 ? state.settings.model : DEFAULT_SETTINGS.model;
+if (state.model !== 'deepseek-reasoner') state.lastPlainModel = state.model;
+state.searchOn = Boolean((readJSON(LS.toggles, {}) || {}).search);
 
 /* ============================================================
  * 基础工具
@@ -301,6 +311,224 @@ function fallbackTitle() {
 }
 
 /* ============================================================
+ * 联网搜索（Wikipedia + DuckDuckGo，均支持 CORS）
+ * ============================================================ */
+
+function hostOf(url) {
+  try {
+    return new URL(url).host.replace(/^www\./, '');
+  } catch {
+    return '';
+  }
+}
+
+async function fetchJSON(url, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms || 7000);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function wikiSearch(lang, query) {
+  const url = 'https://' + lang + '.wikipedia.org/w/api.php?action=query&format=json&origin=*&utf8=1'
+    + '&generator=search&gsrlimit=4&prop=extracts|info&exintro=1&explaintext=1&exlimit=4&inprop=url'
+    + '&gsrsearch=' + encodeURIComponent(query);
+  return fetchJSON(url, 7000).then((j) => {
+    const pages = j && j.query && j.query.pages ? Object.keys(j.query.pages).map((k) => j.query.pages[k]) : [];
+    pages.sort((a, b) => (a.index || 99) - (b.index || 99));
+    return pages
+      .filter((p) => p.extract && p.fullurl)
+      .map((p) => ({
+        title: p.title,
+        url: p.fullurl,
+        snippet: String(p.extract).replace(/\s+/g, ' ').slice(0, 320),
+        host: hostOf(p.fullurl),
+        from: 'Wikipedia',
+      }));
+  }).catch(() => []);
+}
+
+function ddgSearch(query) {
+  const url = 'https://api.duckduckgo.com/?format=json&no_html=1&skip_disambig=1&t=deepseekchat&q='
+    + encodeURIComponent(query);
+  return fetchJSON(url, 7000).then((j) => {
+    const out = [];
+    if (j.AbstractText && j.AbstractURL) {
+      out.push({
+        title: (j.Heading || query).slice(0, 80),
+        url: j.AbstractURL,
+        snippet: String(j.AbstractText).slice(0, 320),
+        host: hostOf(j.AbstractURL),
+        from: 'DuckDuckGo',
+      });
+    }
+    (j.RelatedTopics || []).slice(0, 3).forEach((t) => {
+      if (t.FirstURL && t.Text) {
+        out.push({
+          title: String(t.Text).slice(0, 60),
+          url: t.FirstURL,
+          snippet: String(t.Text).slice(0, 320),
+          host: hostOf(t.FirstURL),
+          from: 'DuckDuckGo',
+        });
+      }
+    });
+    return out;
+  }).catch(() => []);
+}
+
+async function bochaSearch(query) {
+  const res = await fetch('https://api.bochaai.com/v1/web-search', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer ' + state.settings.searchKey,
+    },
+    body: JSON.stringify({ query, summary: true, count: 5, page: 1 }),
+  });
+  if (!res.ok) throw new Error('博查 ' + res.status);
+  const j = await res.json();
+  const list = j && j.data && j.data.webPages && j.data.webPages.value ? j.data.webPages.value : [];
+  return list
+    .filter((x) => x && x.url)
+    .map((x) => ({
+      title: x.name || hostOf(x.url),
+      url: x.url,
+      snippet: String(x.summary || x.snippet || '').replace(/<[^>]+>/g, '').slice(0, 400),
+      host: hostOf(x.url),
+      from: x.siteName || 'Bocha',
+    }));
+}
+
+async function serperSearch(query) {
+  const res = await fetch('https://google.serper.dev/search', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-API-KEY': state.settings.searchKey,
+    },
+    body: JSON.stringify({ q: query, num: 5, hl: 'zh-cn' }),
+  });
+  if (!res.ok) throw new Error('Serper ' + res.status);
+  const j = await res.json();
+  return (j.organic || [])
+    .filter((x) => x && x.link)
+    .map((x) => ({
+      title: x.title || hostOf(x.link),
+      url: x.link,
+      snippet: String(x.snippet || '').slice(0, 400),
+      host: hostOf(x.link),
+      from: x.source || 'Google',
+    }));
+}
+
+async function searchWeb(query) {
+  const q = String(query || '').replace(/\s+/g, ' ').trim().slice(0, 140);
+  if (!q) return [];
+
+  const provider = state.settings.searchProvider;
+  if (provider === 'bocha' && state.settings.searchKey) {
+    try {
+      const r = await bochaSearch(q);
+      if (r.length) return r.slice(0, 6);
+    } catch (err) {
+      console.warn('博查搜索失败', err);
+    }
+  }
+  if (provider === 'serper' && state.settings.searchKey) {
+    try {
+      const r = await serperSearch(q);
+      if (r.length) return r.slice(0, 6);
+    } catch (err) {
+      console.warn('Serper 搜索失败', err);
+    }
+  }
+
+  const seen = {};
+  const all = [];
+  const take = (list) => {
+    list.forEach((r) => {
+      if (!r.url || seen[r.url]) return;
+      seen[r.url] = 1;
+      all.push(r);
+    });
+  };
+
+  const zh = await wikiSearch('zh', q);
+  take(zh);
+  if (all.length < 3) take(await wikiSearch('en', q));
+  if (all.length < 3) take(await ddgSearch(q));
+  return all.slice(0, 6);
+}
+
+function searchSystemMessage(results) {
+  const lines = results.map((r, i) => '[' + (i + 1) + '] ' + r.title + '\n' + r.snippet + '\n链接：' + r.url).join('\n\n');
+  return {
+    role: 'system',
+    content: '以下是刚刚联网检索到的网页资料（' + new Date().toLocaleString('zh-CN') + '）。'
+      + '回答时优先依据这些资料，并在引用处用 [1] 这样的编号标注来源；'
+      + '资料不足以回答时请直接说明，不要编造。\n\n' + lines,
+  };
+}
+
+function renderSources(host, msg) {
+  host.innerHTML = '';
+  if (msg.searching) {
+    host.innerHTML = '<div class="searching"><i class="spinner"></i>正在搜索网页…</div>';
+    return;
+  }
+  if (!msg.search) return;
+  if (msg.searchError) {
+    const p = document.createElement('div');
+    p.className = 'search-note';
+    p.textContent = '联网搜索暂不可用，已直接回答';
+    host.appendChild(p);
+    return;
+  }
+  if (!msg.sources || !msg.sources.length) {
+    const p = document.createElement('div');
+    p.className = 'search-note';
+    p.textContent = '未搜索到相关网页，已直接回答（可在设置里配置博查 / Serper）';
+    host.appendChild(p);
+    return;
+  }
+
+  const details = document.createElement('details');
+  details.className = 'sources';
+  const summary = document.createElement('summary');
+  summary.textContent = '搜索到 ' + msg.sources.length + ' 个网页';
+  details.appendChild(summary);
+
+  const list = document.createElement('div');
+  list.className = 'sources-list';
+  msg.sources.forEach((s, i) => {
+    const a = document.createElement('a');
+    a.className = 'source';
+    a.href = s.url;
+    a.target = '_blank';
+    a.rel = 'noreferrer noopener';
+    const idx = document.createElement('span');
+    idx.className = 'idx';
+    idx.textContent = String(i + 1);
+    const title = document.createElement('span');
+    title.className = 'stitle';
+    title.textContent = s.title || s.url;
+    const hostEl = document.createElement('span');
+    hostEl.className = 'host';
+    hostEl.textContent = s.host || hostOf(s.url);
+    a.append(idx, title, hostEl);
+    list.appendChild(a);
+  });
+  details.appendChild(list);
+  host.appendChild(details);
+}
+
+/* ============================================================
  * GitHub 存储
  * ============================================================ */
 
@@ -458,7 +686,8 @@ async function ghDelete(path, sha) {
 function hashMessages() {
   const s = state.messages
     .filter((m) => !m.error)
-    .map((m) => m.role + '\u0001' + (m.content || '') + '\u0001' + (m.reasoning || ''))
+    .map((m) => m.role + '\u0001' + (m.content || '') + '\u0001' + (m.reasoning || '')
+      + '\u0001' + ((m.sources || []).map((x) => x.url).join(',')))
     .join('\u0002');
   let h = 5381;
   for (let i = 0; i < s.length; i += 1) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
@@ -473,15 +702,8 @@ function isDirty() {
 function setSaveState(kind) {
   const el = $('#saveState');
   if (!el) return;
-  if (!state.messages.length || !kind) {
-    el.textContent = '';
-    el.style.display = 'none';
-    el.removeAttribute('data-s');
-    return;
-  }
-  el.style.display = '';
+  el.dataset.s = state.messages.length ? (kind || '') : '';
   const map = { local: '仅本地', saving: '同步中', saved: '已同步', error: '同步失败', dirty: '待同步' };
-  el.dataset.s = kind;
   el.textContent = map[kind] || '';
 }
 
@@ -542,10 +764,13 @@ async function doSave() {
       createdAt: new Date(createdAt).toISOString(),
       updatedAt: new Date().toISOString(),
       messages: state.messages
-        .filter((m) => !m.error && (m.content || m.reasoning))
+        .filter((m) => !m.error && (m.content || m.reasoning || (m.sources && m.sources.length)))
         .map((m) => {
           const out = { role: m.role, content: m.content, time: new Date(m.time || Date.now()).toISOString() };
           if (m.reasoning) out.reasoning = m.reasoning;
+          if (m.reasoning && m.thinkMs) out.thinkMs = m.thinkMs;
+          if (m.search) out.search = true;
+          if (m.sources && m.sources.length) out.sources = m.sources;
           return out;
         }),
     };
@@ -618,6 +843,7 @@ function persistDraft() {
     localStorage.setItem(LS.draft, JSON.stringify({
       at: Date.now(),
       model: state.model,
+      search: state.searchOn,
       current: state.current,
       messages: state.messages,
     }));
@@ -629,7 +855,7 @@ function restoreDraft() {
   if (!d || !Array.isArray(d.messages) || !d.messages.length) return false;
   if (Date.now() - (d.at || 0) > 1000 * 60 * 60 * 24 * 30) return false;
   state.messages = d.messages;
-  state.model = d.model || state.model;
+  if (MODELS.indexOf(d.model) >= 0) state.model = d.model;
   state.current = Object.assign({ path: '', sha: '', title: '', createdAt: 0, savedHash: '' }, d.current || {});
   return true;
 }
@@ -662,30 +888,8 @@ function setupCard() {
 function emptyState() {
   const wrap = document.createElement('div');
   wrap.className = 'empty';
-  wrap.innerHTML = '<div class="empty-logo">DS</div>'
-    + '<h1>我是 DeepSeek</h1>'
-    + '<p>有什么可以帮你的吗？</p>'
-    + '<div class="chips"></div>';
-  const chips = [
-    '用简单的语言解释量子纠缠',
-    '写一个 Python 爬虫骨架',
-    '帮我把这段话改得更正式',
-    '给我的周末旅行做个计划',
-  ];
-  const box = wrap.querySelector('.chips');
-  chips.forEach((c) => {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.className = 'chip';
-    b.textContent = c;
-    b.addEventListener('click', () => {
-      $('#input').value = c;
-      autoGrow();
-      updateSendState();
-      $('#input').focus();
-    });
-    box.appendChild(b);
-  });
+  wrap.innerHTML = '<h1>有什么可以帮你的吗？</h1>'
+    + '<p>DeepThink 深度思考 · Search 联网检索</p>';
   const card = setupCard();
   if (card) wrap.appendChild(card);
   return wrap;
@@ -714,6 +918,11 @@ function userNode(msg) {
   return wrap;
 }
 
+function thinkLabel(msg) {
+  if (msg.thinkMs) return '已深度思考（' + Math.max(1, Math.round(msg.thinkMs / 1000)) + ' 秒）';
+  return '思考过程';
+}
+
 function assistantNode(msg) {
   const wrap = document.createElement('div');
   wrap.className = 'msg assistant';
@@ -723,9 +932,13 @@ function assistantNode(msg) {
   const think = document.createElement('details');
   think.className = 'think';
   think.hidden = !msg.reasoning;
-  think.innerHTML = '<summary>思考过程</summary><div class="think-body"></div>';
+  think.innerHTML = '<summary>' + thinkLabel(msg) + '</summary><div class="think-body"></div>';
   const thinkBody = think.querySelector('.think-body');
   if (msg.reasoning) thinkBody.textContent = msg.reasoning;
+
+  const sourcesHost = document.createElement('div');
+  sourcesHost.className = 'sources-host';
+  renderSources(sourcesHost, msg);
 
   const md = document.createElement('div');
   md.className = 'md';
@@ -734,13 +947,15 @@ function assistantNode(msg) {
     decorateCode(md);
   } else if (msg.error) {
     md.innerHTML = '<p style="color:var(--danger)">请求失败：' + esc(msg.error) + '</p>';
-  } else {
+  } else if (!msg.searching) {
     md.innerHTML = '<div class="typing"><i></i><i></i><i></i></div>';
+  } else {
+    md.innerHTML = '';
   }
 
   const actions = document.createElement('div');
   actions.className = 'msg-actions';
-  bubble.append(think, md);
+  bubble.append(think, sourcesHost, md);
   wrap.append(bubble, actions);
 
   if (msg.content && !msg.error) {
@@ -749,7 +964,7 @@ function assistantNode(msg) {
       addAct(actions, '重新生成', regenerate);
     }
   }
-  return { wrap, md, think, thinkBody, actions };
+  return { wrap, md, think, thinkBody, actions, sourcesHost };
 }
 
 function renderChat() {
@@ -789,13 +1004,46 @@ function appendNode(node) {
 }
 
 /* ============================================================
+ * 模型 / 开关
+ * ============================================================ */
+
+function syncToggles() {
+  $('#modelSelect').value = state.model;
+  $('#btnThink').classList.toggle('active', state.model === 'deepseek-reasoner');
+  $('#btnThink').setAttribute('aria-pressed', state.model === 'deepseek-reasoner' ? 'true' : 'false');
+  $('#btnSearch').classList.toggle('active', state.searchOn);
+  $('#btnSearch').setAttribute('aria-pressed', state.searchOn ? 'true' : 'false');
+}
+
+function setModel(model) {
+  const next = MODELS.indexOf(model) >= 0 ? model : DEFAULT_SETTINGS.model;
+  if (next !== 'deepseek-reasoner') state.lastPlainModel = next;
+  state.model = next;
+  state.settings.model = next;
+  persistSettings();
+  syncToggles();
+}
+
+function toggleThink() {
+  if (state.model === 'deepseek-reasoner') setModel(state.lastPlainModel || 'deepseek-flash');
+  else setModel('deepseek-reasoner');
+}
+
+function toggleSearch() {
+  state.searchOn = !state.searchOn;
+  try { localStorage.setItem(LS.toggles, JSON.stringify({ search: state.searchOn })); } catch {}
+  syncToggles();
+  toast(state.searchOn ? '已开启联网搜索' : '已关闭联网搜索', 1600);
+}
+
+/* ============================================================
  * 发送 / 流式
  * ============================================================ */
 
 function autoGrow() {
   const t = $('#input');
   t.style.height = 'auto';
-  t.style.height = Math.min(t.scrollHeight, 168) + 'px';
+  t.style.height = Math.min(t.scrollHeight, 200) + 'px';
 }
 
 function updateSendState() {
@@ -804,6 +1052,13 @@ function updateSendState() {
   btn.classList.toggle('streaming', state.streaming);
   btn.disabled = state.streaming ? false : !hasText;
   btn.setAttribute('aria-label', state.streaming ? '停止生成' : '发送');
+}
+
+function lastUserText() {
+  for (let i = state.messages.length - 1; i >= 0; i -= 1) {
+    if (state.messages[i].role === 'user' && state.messages[i].content) return state.messages[i].content;
+  }
+  return '';
 }
 
 async function send(text) {
@@ -846,7 +1101,10 @@ async function regenerate() {
 async function runCompletion() {
   if (!state.messages.some((m) => m.role === 'user')) return;
 
-  const msg = { role: 'assistant', content: '', reasoning: '', time: Date.now() };
+  const useSearch = state.searchOn;
+  const msg = { role: 'assistant', content: '', reasoning: '', time: Date.now(), search: useSearch };
+  if (useSearch) msg.searching = true;
+
   state.messages.push(msg);
   const ref = assistantNode(msg);
   appendNode(ref.wrap);
@@ -856,12 +1114,17 @@ async function runCompletion() {
   const ctrl = new AbortController();
   state.controller = ctrl;
 
+  const thinkStart = Date.now();
   let raf = 0;
   const paint = () => {
     raf = 0;
     if (msg.reasoning) {
       ref.think.hidden = false;
       ref.thinkBody.textContent = msg.reasoning;
+      if (!msg.content) {
+        const sum = ref.think.querySelector('summary');
+        if (sum) sum.textContent = '正在深度思考…';
+      }
     }
     if (msg.content) {
       ref.md.innerHTML = renderMarkdown(msg.content) + '<span class="cursor"></span>';
@@ -870,7 +1133,24 @@ async function runCompletion() {
   };
 
   try {
-    await streamChat(apiMessages(), {
+    let apiBody = apiMessages();
+
+    if (useSearch) {
+      let sources = [];
+      try {
+        sources = await searchWeb(lastUserText());
+      } catch (err) {
+        msg.searchError = err.message || '搜索失败';
+      }
+      msg.searching = false;
+      msg.sources = sources;
+      renderSources(ref.sourcesHost, msg);
+      if (!msg.content) ref.md.innerHTML = '<div class="typing"><i></i><i></i><i></i></div>';
+      if (sources.length) apiBody = [searchSystemMessage(sources)].concat(apiBody);
+      scrollToBottom();
+    }
+
+    await streamChat(apiBody, {
       signal: ctrl.signal,
       onDelta: (d) => {
         if (d.reasoning) {
@@ -890,6 +1170,7 @@ async function runCompletion() {
   } finally {
     state.streaming = false;
     state.controller = null;
+    msg.searching = false;
     if (raf) { cancelAnimationFrame(raf); paint(); }
 
     if (msg.content) {
@@ -901,6 +1182,13 @@ async function runCompletion() {
       ref.md.innerHTML = '<p style="color:var(--text-3)">已停止生成</p>';
     } else {
       ref.md.innerHTML = '';
+    }
+
+    if (msg.reasoning) {
+      msg.thinkMs = Date.now() - thinkStart;
+      const sum = ref.think.querySelector('summary');
+      if (sum) sum.textContent = thinkLabel(msg);
+      ref.think.open = false;
     }
 
     ref.actions.innerHTML = '';
@@ -953,22 +1241,21 @@ function renderList() {
 
   if (!ghReady()) {
     const tip = document.createElement('div');
-    tip.className = 'drawer-empty';
-    tip.innerHTML = '还没有配置 GitHub 存储。<br>配置后对话会自动同步到仓库，<br>换设备也能接着聊。';
-    box.appendChild(tip);
+    tip.className = 'sb-empty';
+    tip.innerHTML = '<div class="sb-empty-tip">还没有配置 GitHub 存储。<br>配置后对话会自动同步，<br>换设备也能接着聊。</div>';
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'ghost-btn';
-    btn.style.margin = '0 auto';
     btn.textContent = '去配置';
     btn.addEventListener('click', () => openSettings());
-    box.appendChild(btn);
+    tip.appendChild(btn);
+    box.appendChild(tip);
     return;
   }
 
   if (!items.length) {
     const tip = document.createElement('div');
-    tip.className = 'drawer-empty';
+    tip.className = 'sb-empty';
     tip.textContent = keyword ? '没有匹配的对话' : '还没有对话记录';
     box.appendChild(tip);
     return;
@@ -1039,19 +1326,19 @@ async function newChat() {
   if (state.streaming) stopStream();
   await flushSave();
   resetChat();
-  closeDrawer();
+  closeSidebar();
   $('#input').focus();
 }
 
 async function openConv(item) {
-  closeDrawer();
+  closeSidebar();
   if (state.streaming) stopStream();
   if (item.path === state.current.path) return;
 
   await flushSave();
   const sid = ++state.sid;
   const chat = $('#chat');
-  chat.innerHTML = '<div class="drawer-empty" style="height:100%;display:grid;place-items:center">加载中…</div>';
+  chat.innerHTML = '<div class="sb-empty" style="margin:auto">加载中…</div>';
 
   try {
     const file = await ghGet(item.path);
@@ -1060,7 +1347,7 @@ async function openConv(item) {
     state.messages = Array.isArray(data.messages)
       ? data.messages.map((m) => Object.assign({}, m, { time: m.time ? new Date(m.time).getTime() : item.time }))
       : [];
-    state.model = MODELS.indexOf(data.model) >= 0 ? data.model : state.model;
+    if (MODELS.indexOf(data.model) >= 0) state.model = data.model;
     state.current = {
       path: item.path,
       sha: file.sha,
@@ -1068,7 +1355,7 @@ async function openConv(item) {
       createdAt: data.createdAt ? new Date(data.createdAt).getTime() : item.time,
       savedHash: '',
     };
-    $('#modelSelect').value = state.model;
+    syncToggles();
     renderChat();
     state.current.savedHash = hashMessages();
     setSaveState('saved');
@@ -1105,12 +1392,14 @@ function openSettings(firstRun) {
   const s = state.settings;
   $('#setApiKey').value = s.apiKey || '';
   $('#setApiBase').value = s.apiBase || DEFAULT_SETTINGS.apiBase;
-  $('#setModel').value = s.model || 'deepseek-chat';
+  $('#setModel').value = MODELS.indexOf(s.model) >= 0 ? s.model : DEFAULT_SETTINGS.model;
   $('#setGhToken').value = s.ghToken || '';
   $('#setGhOwner').value = s.ghOwner || '';
   $('#setGhRepo').value = s.ghRepo || '';
   $('#setGhBranch').value = s.ghBranch || 'main';
   $('#setGhDir').value = s.ghDir || '';
+  $('#setSearchProvider').value = s.searchProvider || 'builtin';
+  $('#setSearchKey').value = s.searchKey || '';
   $('#setTheme').value = state.themePref;
   $('#settingsTitle').textContent = firstRun ? '开始使用' : '设置';
   $('#settingsSub').textContent = firstRun
@@ -1133,11 +1422,14 @@ function collectSettings() {
     ghRepo: $('#setGhRepo').value.trim(),
     ghBranch: $('#setGhBranch').value.trim() || 'main',
     ghDir: $('#setGhDir').value.trim().replace(/^\/+|\/+$/g, ''),
+    searchProvider: $('#setSearchProvider').value,
+    searchKey: $('#setSearchKey').value.trim(),
   };
-  state.model = state.settings.model;
-  $('#modelSelect').value = state.model;
+  state.model = MODELS.indexOf(state.settings.model) >= 0 ? state.settings.model : DEFAULT_SETTINGS.model;
+  if (state.model !== 'deepseek-reasoner') state.lastPlainModel = state.model;
   persistSettings();
   applyTheme($('#setTheme').value);
+  syncToggles();
 }
 
 async function testConnections() {
@@ -1171,18 +1463,23 @@ async function testConnections() {
 }
 
 /* ============================================================
- * 抽屉
+ * 侧边栏
  * ============================================================ */
 
-function openDrawer() {
-  $('#drawer').classList.add('show');
+function openSidebar() {
+  $('#sidebar').classList.add('show');
   $('#scrim').classList.add('show');
   renderList();
 }
 
-function closeDrawer() {
-  $('#drawer').classList.remove('show');
+function closeSidebar() {
+  $('#sidebar').classList.remove('show');
   $('#scrim').classList.remove('show');
+}
+
+function setCollapsed(collapsed) {
+  $('#app').classList.toggle('collapsed', collapsed);
+  try { localStorage.setItem(LS.collapsed, collapsed ? '1' : '0'); } catch {}
 }
 
 /* ============================================================
@@ -1190,12 +1487,13 @@ function closeDrawer() {
  * ============================================================ */
 
 function bind() {
-  $('#btnMenu').addEventListener('click', openDrawer);
-  $('#scrim').addEventListener('click', closeDrawer);
+  $('#btnMenu').addEventListener('click', openSidebar);
+  $('#scrim').addEventListener('click', closeSidebar);
   $('#btnNew').addEventListener('click', newChat);
-  $('#btnNew2').addEventListener('click', newChat);
-  $('#btnSettingsTop').addEventListener('click', () => openSettings());
-  $('#btnSettings').addEventListener('click', () => { closeDrawer(); openSettings(); });
+  $('#btnNewMobile').addEventListener('click', newChat);
+  $('#btnCollapse').addEventListener('click', () => setCollapsed(true));
+  $('#btnExpand').addEventListener('click', () => setCollapsed(false));
+  $('#btnSettings').addEventListener('click', () => { closeSidebar(); openSettings(); });
   $('#btnCloseSettings').addEventListener('click', closeSettings);
   $('#btnSaveSettings').addEventListener('click', () => {
     collectSettings();
@@ -1206,12 +1504,14 @@ function bind() {
     toast('设置已保存');
   });
   $('#btnTest').addEventListener('click', testConnections);
-  $('#btnRefresh').addEventListener('click', () => { loadList({}); });
   $('#searchInput').addEventListener('input', renderList);
 
   $('#settingsModal').addEventListener('click', (ev) => {
     if (ev.target === $('#settingsModal')) closeSettings();
   });
+
+  $('#btnThink').addEventListener('click', toggleThink);
+  $('#btnSearch').addEventListener('click', toggleSearch);
 
   $('#btnSend').addEventListener('click', () => {
     if (state.streaming) stopStream();
@@ -1227,11 +1527,7 @@ function bind() {
     send();
   });
 
-  $('#modelSelect').addEventListener('change', (ev) => {
-    state.model = ev.target.value;
-    state.settings.model = state.model;
-    persistSettings();
-  });
+  $('#modelSelect').addEventListener('change', (ev) => setModel(ev.target.value));
 
   $('#chat').addEventListener('scroll', () => {
     const chat = $('#chat');
@@ -1241,7 +1537,7 @@ function bind() {
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') {
       closeSettings();
-      closeDrawer();
+      closeSidebar();
     }
   });
 
@@ -1258,7 +1554,8 @@ function bind() {
 function init() {
   initTheme();
   bind();
-  $('#modelSelect').value = state.model;
+  setCollapsed(localStorage.getItem(LS.collapsed) === '1');
+  syncToggles();
   $('#setTheme').value = state.themePref;
 
   const restored = restoreDraft();

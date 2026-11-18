@@ -4,8 +4,11 @@
 
 ## 功能
 
-- 仿 DeepSeek App 的界面：左侧抽屉式历史记录、底部输入框、思考过程折叠、代码块复制
-- 模型可在输入框下方随时切换：`deepseek-flash`（默认）、`deepseek-chat`、`deepseek-reasoner`（R1 的思考过程单独展示）
+- 参考 DeepSeek 官方 chat-demo 的界面：桌面常驻侧边栏（可收起）、移动端抽屉、居中的对话栏、卡片式输入框
+- 输入框内集成 `DeepThink` / `Search` 开关，右侧可切换模型：`deepseek-flash`（默认）、V3、R1
+- **DeepThink**：一键切换到 `deepseek-reasoner`，思考过程实时展开、结束后折叠并显示耗时
+- **Search**：先联网检索再把网页摘要作为上下文交给模型，回答带 [1] 引用，消息上方可展开查看来源
+- 搜索源可配置：内置（Wikipedia / DuckDuckGo，免 Key）、博查 Bocha、Serper（Google）
 - 标题总结固定使用轻量模型，不占用 R1 的思考开销
 - SSE 流式输出，可中途停止、可重新生成
 - 每轮对话结束后自动保存：
@@ -15,6 +18,16 @@
 - 历史列表通过 GitHub **git tree API**（`GET /repos/{owner}/{repo}/git/trees/{branch}?recursive=1`）读取文件名生成，按时间倒序、按月分组
 - 未配置 GitHub 时，对话暂存在浏览器本地，不会丢
 - 支持深色 / 浅色 / 跟随系统
+
+## 联网搜索
+
+| 搜索源 | 需要 Key | 说明 |
+| --- | --- | --- |
+| 内置 | 否 | Wikipedia + DuckDuckGo 公开接口，部分地区网络访问不了 |
+| 博查 Bocha | 是 | <https://bochaai.com>，中文结果好，浏览器可直连 |
+| Serper | 是 | <https://serper.dev>，Google 结果，免费额度较大 |
+
+在设置 → 联网搜索里选择搜索源并填写 Key。未配置或请求失败时会自动回退到内置源；仍然没有结果时会提示「未搜索到相关网页」并直接回答。
 
 ## 快速开始
 
