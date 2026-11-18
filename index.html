@@ -159,23 +159,6 @@
       </section>
 
       <section class="form-section">
-        <h3>联网搜索</h3>
-        <p class="section-note">内置源用 Wikipedia / DuckDuckGo，无需 Key，但部分网络访问不了；国内推荐博查。</p>
-        <label class="field">
-          <span>搜索源</span>
-          <select id="setSearchProvider">
-            <option value="builtin">内置（Wikipedia / DuckDuckGo）</option>
-            <option value="bocha">博查 Bocha</option>
-            <option value="serper">Serper（Google）</option>
-          </select>
-        </label>
-        <label class="field">
-          <span>搜索 API Key（可选）</span>
-          <input id="setSearchKey" type="password" autocomplete="off" placeholder="选博查 / Serper 时填写" />
-        </label>
-      </section>
-
-      <section class="form-section">
         <h3>外观</h3>
         <label class="field">
           <span>主题</span>
@@ -188,7 +171,7 @@
       </section>
     </div>
     <div class="modal-foot">
-      <p class="footnote">Key 与 Token 只保存在本机浏览器 localStorage，请求直接从浏览器发往 DeepSeek、GitHub 与所选搜索服务，不经过任何第三方服务器。</p>
+      <p class="footnote">Key 与 Token 只保存在本机浏览器 localStorage，请求直接从浏览器发往 DeepSeek 与 GitHub，不经过任何第三方服务器。</p>
       <div class="modal-actions">
         <button class="ghost-btn" id="btnTest">测试连接</button>
         <button class="primary-btn" id="btnSaveSettings">保存</button>

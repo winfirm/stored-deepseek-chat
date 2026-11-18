@@ -15,7 +15,6 @@ const LS = {
   list: 'dsc.list',
   draft: 'dsc.draft',
   theme: 'dsc.theme',
-  toggles: 'dsc.toggles',
   collapsed: 'dsc.collapsed',
 };
 
@@ -28,8 +27,6 @@ const DEFAULT_SETTINGS = {
   ghRepo: '',
   ghBranch: 'main',
   ghDir: 'chats',
-  searchProvider: 'builtin',
-  searchKey: '',
 };
 
 const MODELS = ['deepseek-flash', 'deepseek-chat', 'deepseek-reasoner'];
@@ -52,7 +49,7 @@ const state = {
 
 state.model = MODELS.indexOf(state.settings.model) >= 0 ? state.settings.model : DEFAULT_SETTINGS.model;
 if (state.model !== 'deepseek-reasoner') state.lastPlainModel = state.model;
-state.searchOn = Boolean((readJSON(LS.toggles, {}) || {}).search);
+state.searchOn = false;
 
 /* ============================================================
  * 基础工具
@@ -311,7 +308,7 @@ function fallbackTitle() {
 }
 
 /* ============================================================
- * 联网搜索（Wikipedia + DuckDuckGo，均支持 CORS）
+ * 网页搜索（DeepSeek /v1/tools/search）
  * ============================================================ */
 
 function hostOf(url) {
@@ -322,155 +319,48 @@ function hostOf(url) {
   }
 }
 
-async function fetchJSON(url, ms) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), ms || 7000);
-  try {
-    const res = await fetch(url, { signal: ctrl.signal });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    return await res.json();
-  } finally {
-    clearTimeout(timer);
-  }
+function searchEndpoint() {
+  const base = String(state.settings.apiBase || DEFAULT_SETTINGS.apiBase).replace(/\/+$/, '');
+  return base.replace(/\/v1$/, '') + '/v1/tools/search';
 }
 
-function wikiSearch(lang, query) {
-  const url = 'https://' + lang + '.wikipedia.org/w/api.php?action=query&format=json&origin=*&utf8=1'
-    + '&generator=search&gsrlimit=4&prop=extracts|info&exintro=1&explaintext=1&exlimit=4&inprop=url'
-    + '&gsrsearch=' + encodeURIComponent(query);
-  return fetchJSON(url, 7000).then((j) => {
-    const pages = j && j.query && j.query.pages ? Object.keys(j.query.pages).map((k) => j.query.pages[k]) : [];
-    pages.sort((a, b) => (a.index || 99) - (b.index || 99));
-    return pages
-      .filter((p) => p.extract && p.fullurl)
-      .map((p) => ({
-        title: p.title,
-        url: p.fullurl,
-        snippet: String(p.extract).replace(/\s+/g, ' ').slice(0, 320),
-        host: hostOf(p.fullurl),
-        from: 'Wikipedia',
-      }));
-  }).catch(() => []);
-}
-
-function ddgSearch(query) {
-  const url = 'https://api.duckduckgo.com/?format=json&no_html=1&skip_disambig=1&t=deepseekchat&q='
-    + encodeURIComponent(query);
-  return fetchJSON(url, 7000).then((j) => {
-    const out = [];
-    if (j.AbstractText && j.AbstractURL) {
-      out.push({
-        title: (j.Heading || query).slice(0, 80),
-        url: j.AbstractURL,
-        snippet: String(j.AbstractText).slice(0, 320),
-        host: hostOf(j.AbstractURL),
-        from: 'DuckDuckGo',
-      });
-    }
-    (j.RelatedTopics || []).slice(0, 3).forEach((t) => {
-      if (t.FirstURL && t.Text) {
-        out.push({
-          title: String(t.Text).slice(0, 60),
-          url: t.FirstURL,
-          snippet: String(t.Text).slice(0, 320),
-          host: hostOf(t.FirstURL),
-          from: 'DuckDuckGo',
-        });
-      }
-    });
-    return out;
-  }).catch(() => []);
-}
-
-async function bochaSearch(query) {
-  const res = await fetch('https://api.bochaai.com/v1/web-search', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: 'Bearer ' + state.settings.searchKey,
-    },
-    body: JSON.stringify({ query, summary: true, count: 5, page: 1 }),
-  });
-  if (!res.ok) throw new Error('博查 ' + res.status);
-  const j = await res.json();
-  const list = j && j.data && j.data.webPages && j.data.webPages.value ? j.data.webPages.value : [];
-  return list
-    .filter((x) => x && x.url)
-    .map((x) => ({
-      title: x.name || hostOf(x.url),
-      url: x.url,
-      snippet: String(x.summary || x.snippet || '').replace(/<[^>]+>/g, '').slice(0, 400),
-      host: hostOf(x.url),
-      from: x.siteName || 'Bocha',
-    }));
-}
-
-async function serperSearch(query) {
-  const res = await fetch('https://google.serper.dev/search', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-API-KEY': state.settings.searchKey,
-    },
-    body: JSON.stringify({ q: query, num: 5, hl: 'zh-cn' }),
-  });
-  if (!res.ok) throw new Error('Serper ' + res.status);
-  const j = await res.json();
-  return (j.organic || [])
-    .filter((x) => x && x.link)
-    .map((x) => ({
-      title: x.title || hostOf(x.link),
-      url: x.link,
-      snippet: String(x.snippet || '').slice(0, 400),
-      host: hostOf(x.link),
-      from: x.source || 'Google',
-    }));
-}
-
-async function searchWeb(query) {
-  const q = String(query || '').replace(/\s+/g, ' ').trim().slice(0, 140);
+async function searchWeb(query, original) {
+  const q = String(query || '').replace(/\s+/g, ' ').trim().slice(0, 128);
   if (!q) return [];
-
-  const provider = state.settings.searchProvider;
-  if (provider === 'bocha' && state.settings.searchKey) {
-    try {
-      const r = await bochaSearch(q);
-      if (r.length) return r.slice(0, 6);
-    } catch (err) {
-      console.warn('博查搜索失败', err);
-    }
-  }
-  if (provider === 'serper' && state.settings.searchKey) {
-    try {
-      const r = await serperSearch(q);
-      if (r.length) return r.slice(0, 6);
-    } catch (err) {
-      console.warn('Serper 搜索失败', err);
-    }
-  }
-
-  const seen = {};
-  const all = [];
-  const take = (list) => {
-    list.forEach((r) => {
-      if (!r.url || seen[r.url]) return;
-      seen[r.url] = 1;
-      all.push(r);
-    });
-  };
-
-  const zh = await wikiSearch('zh', q);
-  take(zh);
-  if (all.length < 3) take(await wikiSearch('en', q));
-  if (all.length < 3) take(await ddgSearch(q));
-  return all.slice(0, 6);
+  const res = await fetch(searchEndpoint(), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer ' + state.settings.apiKey,
+    },
+    body: JSON.stringify({
+      query: q,
+      count: 5,
+      ori_question: String(original || q).slice(0, 128),
+    }),
+  });
+  if (!res.ok) throw await apiError(res);
+  const j = await res.json();
+  return (j.results || [])
+    .filter((r) => r && r.url)
+    .map((r) => ({
+      title: r.title || hostOf(r.url),
+      url: r.url,
+      snippet: r.snippet || r.summary || '',
+      summary: r.summary || r.snippet || '',
+      host: r.site_name || hostOf(r.url),
+      score: typeof r.rerank_score === 'number' ? r.rerank_score : null,
+      date: r.date || '',
+    }));
 }
 
 function searchSystemMessage(results) {
-  const lines = results.map((r, i) => '[' + (i + 1) + '] ' + r.title + '\n' + r.snippet + '\n链接：' + r.url).join('\n\n');
+  const lines = results.map((r, i) => '[' + (i + 1) + '] ' + r.title
+    + (r.date ? '（' + String(r.date).slice(0, 10) + '）' : '')
+    + '\n' + (r.summary || r.snippet) + '\n链接：' + r.url).join('\n\n');
   return {
     role: 'system',
-    content: '以下是刚刚联网检索到的网页资料（' + new Date().toLocaleString('zh-CN') + '）。'
+    content: '以下是刚刚通过网页搜索检索到的资料（' + new Date().toLocaleString('zh-CN') + '）。'
       + '回答时优先依据这些资料，并在引用处用 [1] 这样的编号标注来源；'
       + '资料不足以回答时请直接说明，不要编造。\n\n' + lines,
   };
@@ -486,14 +376,14 @@ function renderSources(host, msg) {
   if (msg.searchError) {
     const p = document.createElement('div');
     p.className = 'search-note';
-    p.textContent = '联网搜索暂不可用，已直接回答';
+    p.textContent = '网页搜索暂不可用，已直接回答';
     host.appendChild(p);
     return;
   }
   if (!msg.sources || !msg.sources.length) {
     const p = document.createElement('div');
     p.className = 'search-note';
-    p.textContent = '未搜索到相关网页，已直接回答（可在设置里配置博查 / Serper）';
+    p.textContent = '未搜索到相关网页，已直接回答';
     host.appendChild(p);
     return;
   }
@@ -518,6 +408,7 @@ function renderSources(host, msg) {
     const title = document.createElement('span');
     title.className = 'stitle';
     title.textContent = s.title || s.url;
+    title.title = s.snippet || s.title || '';
     const hostEl = document.createElement('span');
     hostEl.className = 'host';
     hostEl.textContent = s.host || hostOf(s.url);
@@ -1031,7 +922,6 @@ function toggleThink() {
 
 function toggleSearch() {
   state.searchOn = !state.searchOn;
-  try { localStorage.setItem(LS.toggles, JSON.stringify({ search: state.searchOn })); } catch {}
   syncToggles();
   toast(state.searchOn ? '已开启联网搜索' : '已关闭联网搜索', 1600);
 }
@@ -1138,7 +1028,8 @@ async function runCompletion() {
     if (useSearch) {
       let sources = [];
       try {
-        sources = await searchWeb(lastUserText());
+        const q = lastUserText();
+        sources = await searchWeb(q, q);
       } catch (err) {
         msg.searchError = err.message || '搜索失败';
       }
@@ -1315,6 +1206,9 @@ async function loadList(opts) {
 function resetChat() {
   state.sid += 1;
   state.messages = [];
+  state.searchOn = false;
+  if (state.model === 'deepseek-reasoner') setModel(state.lastPlainModel || DEFAULT_SETTINGS.model);
+  syncToggles();
   state.current = { path: '', sha: '', title: '', createdAt: 0, savedHash: '' };
   localStorage.removeItem(LS.draft);
   renderChat();
@@ -1398,8 +1292,6 @@ function openSettings(firstRun) {
   $('#setGhRepo').value = s.ghRepo || '';
   $('#setGhBranch').value = s.ghBranch || 'main';
   $('#setGhDir').value = s.ghDir || '';
-  $('#setSearchProvider').value = s.searchProvider || 'builtin';
-  $('#setSearchKey').value = s.searchKey || '';
   $('#setTheme').value = state.themePref;
   $('#settingsTitle').textContent = firstRun ? '开始使用' : '设置';
   $('#settingsSub').textContent = firstRun
@@ -1422,8 +1314,6 @@ function collectSettings() {
     ghRepo: $('#setGhRepo').value.trim(),
     ghBranch: $('#setGhBranch').value.trim() || 'main',
     ghDir: $('#setGhDir').value.trim().replace(/^\/+|\/+$/g, ''),
-    searchProvider: $('#setSearchProvider').value,
-    searchKey: $('#setSearchKey').value.trim(),
   };
   state.model = MODELS.indexOf(state.settings.model) >= 0 ? state.settings.model : DEFAULT_SETTINGS.model;
   if (state.model !== 'deepseek-reasoner') state.lastPlainModel = state.model;

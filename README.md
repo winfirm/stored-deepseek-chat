@@ -8,7 +8,7 @@
 - 输入框内集成 `DeepThink` / `Search` 开关，右侧可切换模型：`deepseek-flash`（默认）、V3、R1
 - **DeepThink**：一键切换到 `deepseek-reasoner`，思考过程实时展开、结束后折叠并显示耗时
 - **Search**：先联网检索再把网页摘要作为上下文交给模型，回答带 [1] 引用，消息上方可展开查看来源
-- 搜索源可配置：内置（Wikipedia / DuckDuckGo，免 Key）、博查 Bocha、Serper（Google）
+- 搜索走 DeepSeek 官方接口 `POST /v1/tools/search`，与聊天共用一个 API Key
 - 标题总结固定使用轻量模型，不占用 R1 的思考开销
 - SSE 流式输出，可中途停止、可重新生成
 - 每轮对话结束后自动保存：
@@ -21,13 +21,18 @@
 
 ## 联网搜索
 
-| 搜索源 | 需要 Key | 说明 |
-| --- | --- | --- |
-| 内置 | 否 | Wikipedia + DuckDuckGo 公开接口，部分地区网络访问不了 |
-| 博查 Bocha | 是 | <https://bochaai.com>，中文结果好，浏览器可直连 |
-| Serper | 是 | <https://serper.dev>，Google 结果，免费额度较大 |
+Search 开关使用 DeepSeek 官方文档中的网页搜索接口（<https://api-docs.deepseek.com/zh-cn/api/search>）：
 
-在设置 → 联网搜索里选择搜索源并填写 Key。未配置或请求失败时会自动回退到内置源；仍然没有结果时会提示「未搜索到相关网页」并直接回答。
+```
+POST https://api.deepseek.com/v1/tools/search
+Authorization: Bearer <同一个 DeepSeek API Key>
+{ "query": "...", "count": 5, "ori_question": "..." }
+```
+
+- 返回的 `summary`（长摘要）作为上下文交给模型，回答里用 `[1]` 标注来源
+- 消息上方可展开「搜索到 N 个网页」，列表来自返回的 `title` / `site_name` / `url`
+- 搜索失败或无结果时会提示并直接回答，不会中断对话
+- 该接口按次计费，具体见官方指南 <https://api-docs.deepseek.com/zh-cn/guides/search>
 
 ## 快速开始
 
