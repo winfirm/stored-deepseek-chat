@@ -1,6 +1,8 @@
-# DeepSeek Chat H5
+# Store DeepSeek Chat
 
 一个仿 DeepSeek App 的聊天页面（桌面与手机自适应），使用**自己的 DeepSeek API Key** 聊天，对话自动保存到**自己的 GitHub 仓库**。纯静态前端，无需服务器、无需构建，可直接部署到 GitHub Pages 或任意静态托管。
+
+**Store-Deepseek-Chat**: [https://winfirm.top/stored-deepseek-chat/](https://winfirm.top/stored-deepseek-chat/)
 
 ## 功能
 
