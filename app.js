@@ -31,6 +31,36 @@ const DEFAULT_SETTINGS = {
 
 const EFFORTS = ['low', 'high', 'max'];
 
+/* 上传文件：按扩展名决定 purpose 与体积上限（上限来自 Files API 文档） */
+const ATTACH_MAX = 20;
+
+/* 文件存储配额（Files API 文档：单账号 25 GiB / 10,000 个文件） */
+const FILE_QUOTA = { count: 10000, bytes: 25 * 1024 * 1024 * 1024 };
+const USAGE_TTL = 10 * 60 * 1000;
+const ATTACH_KINDS = [
+  {
+    kind: 'image',
+    purpose: 'user_data',
+    max: 64 * 1024 * 1024,
+    exts: ['jpg', 'jpeg', 'png', 'gif', 'webp'],
+  },
+  {
+    kind: 'doc',
+    purpose: 'rich_layout_recognition',
+    max: 100 * 1024 * 1024,
+    exts: ['pdf', 'doc', 'docx', 'ppt', 'pptx'],
+  },
+  {
+    kind: 'data',
+    purpose: 'user_data',
+    max: 32 * 1024 * 1024,
+    exts: ['txt', 'md', 'markdown', 'csv', 'tsv', 'json', 'jsonl', 'xlsx', 'xls', 'epub', 'mobi',
+      'log', 'xml', 'yaml', 'yml', 'html', 'htm', 'css', 'js', 'mjs', 'ts', 'jsx', 'tsx', 'py',
+      'java', 'go', 'rs', 'c', 'h', 'cpp', 'hpp', 'cs', 'php', 'rb', 'swift', 'kt', 'sql', 'sh',
+      'ini', 'conf', 'toml'],
+  },
+];
+
 const state = {
   settings: readSettings(),
   model: '',
@@ -46,6 +76,7 @@ const state = {
   searchOn: false,
   thinking: false,
   effort: 'high',
+  attachments: [],
 };
 
 state.model = DEFAULT_SETTINGS.model;
@@ -186,8 +217,9 @@ function apiUrl(pathname) {
 
 function apiMessages() {
   return state.messages
-    .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.content && !m.error)
-    .map((m) => ({ role: m.role, content: m.content }));
+    .filter((m) => (m.role === 'user' || m.role === 'assistant') && !m.error
+      && (m.content || (m.files && m.files.length)))
+    .map((m) => ({ role: m.role, content: apiContent(m) }));
 }
 
 async function apiError(res) {
@@ -210,9 +242,10 @@ async function streamChat(messages, opts) {
     stream: true,
     stream_options: { include_usage: true },
     thinking: { type: state.thinking ? 'enabled' : 'disabled' },
+    // reasoning_effort 默认 high 会重新打开思考，关闭时必须显式传 none
+    reasoning_effort: state.thinking ? state.effort : 'none',
   };
-  if (state.thinking) body.reasoning_effort = state.effort;
-  else body.temperature = 1;
+  if (!state.thinking) body.temperature = 1;
 
   const res = await fetch(apiUrl('/chat/completions'), {
     method: 'POST',
@@ -259,9 +292,12 @@ async function streamChat(messages, opts) {
 
 async function generateTitle(messages) {
   const text = messages
-    .filter((m) => m.content && !m.error)
+    .filter((m) => !m.error && (m.content || (m.files && m.files.length)))
     .slice(-8)
-    .map((m) => (m.role === 'user' ? '用户：' : '助手：') + m.content)
+    .map((m) => {
+      const files = (m.files || []).map((f) => '［文件：' + f.name + '］').join('');
+      return (m.role === 'user' ? '用户：' : '助手：') + (m.content || '') + files;
+    })
     .join('\n')
     .slice(0, 2400);
 
@@ -276,6 +312,7 @@ async function generateTitle(messages) {
       model,
       stream: false,
       thinking: { type: 'disabled' },
+      reasoning_effort: 'none',
       temperature: 0.3,
       max_tokens: 40,
       messages: [
@@ -304,9 +341,466 @@ function cleanTitle(raw) {
 }
 
 function fallbackTitle() {
-  const first = state.messages.find((m) => m.role === 'user' && m.content);
-  const t = cleanTitle(first ? first.content : '新对话');
+  const first = state.messages.find((m) => m.role === 'user' && (m.content || (m.files && m.files.length)));
+  let raw = '新对话';
+  if (first && first.content) raw = first.content;
+  else if (first && first.files && first.files.length) raw = first.files[0].name;
+  const t = cleanTitle(raw);
   return Array.from(t).slice(0, 16).join('') || '新对话';
+}
+
+/* ============================================================
+ * 附件上传（Files API）
+ * ============================================================ */
+
+const ICON_FILE = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Z"/><path d="M14 3v5h5"/></svg>';
+
+let attachSeq = 0;
+
+function fileExt(name) {
+  const m = /\.([a-z0-9]+)$/i.exec(String(name || ''));
+  return m ? m[1].toLowerCase() : '';
+}
+
+function attachSpec(name) {
+  const ext = fileExt(name);
+  for (let i = 0; i < ATTACH_KINDS.length; i += 1) {
+    if (ATTACH_KINDS[i].exts.indexOf(ext) >= 0) return ATTACH_KINDS[i];
+  }
+  return null;
+}
+
+function formatBytes(n) {
+  const v = Number(n) || 0;
+  if (v < 1024) return v + ' B';
+  if (v < 1024 * 1024) return (v / 1024).toFixed(v < 10 * 1024 ? 1 : 0) + ' KB';
+  if (v < 1024 * 1024 * 1024) return (v / 1024 / 1024).toFixed(v < 10 * 1024 * 1024 ? 1 : 0) + ' MB';
+  return (v / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+
+function uploadStateText(item) {
+  if (item.status === 'error') return item.error ? '失败：' + item.error : '上传失败';
+  if (item.status === 'parsing') return '解析中…';
+  if (item.status === 'uploading') return '上传中 ' + (item.progress || 0) + '%';
+  return formatBytes(item.size);
+}
+
+function newAttachment(file, spec) {
+  attachSeq += 1;
+  return {
+    key: 'att' + attachSeq + '_' + Date.now(),
+    name: file.name,
+    size: file.size,
+    kind: spec.kind,
+    purpose: spec.purpose,
+    status: 'uploading',
+    progress: 0,
+    id: '',
+    error: '',
+    url: spec.kind === 'image' ? URL.createObjectURL(file) : '',
+  };
+}
+
+function uploadAttachment(item, file) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', apiUrl('/files'));
+    xhr.setRequestHeader('Authorization', 'Bearer ' + state.settings.apiKey);
+    xhr.timeout = 300000;
+
+    const fd = new FormData();
+    // purpose 必须排在 file 之前，文档解析要靠它
+    fd.append('purpose', item.purpose);
+    fd.append('file', file, item.name);
+
+    xhr.upload.addEventListener('progress', (ev) => {
+      if (!ev.lengthComputable) return;
+      item.progress = Math.min(99, Math.round((ev.loaded / ev.total) * 100));
+      if (item.progress >= 99 && item.status === 'uploading') item.status = 'parsing';
+      paintAttachment(item);
+    });
+
+    xhr.addEventListener('load', () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        let json = null;
+        try { json = JSON.parse(xhr.responseText); } catch {}
+        if (!json || !json.id) {
+          reject(new Error('返回结果缺少 file_id'));
+          return;
+        }
+        resolve(json);
+        return;
+      }
+      let msg = '';
+      try {
+        const json = JSON.parse(xhr.responseText);
+        msg = (json && json.error && json.error.message) || (json && json.message) || '';
+      } catch {
+        msg = xhr.responseText || '';
+      }
+      reject(new Error('上传失败 ' + xhr.status + (msg ? '：' + String(msg).slice(0, 160) : '')));
+    });
+    xhr.addEventListener('error', () => reject(new Error('网络错误，上传失败')));
+    xhr.addEventListener('timeout', () => reject(new Error('上传超时')));
+    xhr.addEventListener('abort', () => reject(new Error('已取消')));
+    item.xhr = xhr;
+    xhr.send(fd);
+  });
+}
+
+function deleteRemoteFile(id) {
+  if (!id || !state.settings.apiKey) return;
+  fetch(apiUrl('/files/' + encodeURIComponent(id)), {
+    method: 'DELETE',
+    headers: { Authorization: 'Bearer ' + state.settings.apiKey },
+  }).catch(() => {});
+}
+
+/* ---------- 文件用量 ---------- */
+
+const usageState = { at: 0, key: '', data: null, promise: null, warned: false };
+
+function usagePercent(data) {
+  if (!data) return 0;
+  const byBytes = data.bytes / FILE_QUOTA.bytes;
+  const byCount = data.count / FILE_QUOTA.count;
+  return Math.min(100, Math.round(Math.max(byBytes, byCount) * 100));
+}
+
+async function fetchFileUsage(key) {
+  let after = '';
+  let count = 0;
+  let bytes = 0;
+  let pages = 0;
+  let partial = false;
+
+  for (;;) {
+    const qs = new URLSearchParams();
+    qs.set('limit', '1000');
+    qs.set('order', 'desc');
+    if (after) qs.set('after', after);
+
+    const res = await fetch(apiUrl('/files?' + qs.toString()), {
+      headers: { Authorization: 'Bearer ' + key },
+    });
+    if (!res.ok) throw await apiError(res);
+
+    const json = await res.json();
+    (json.data || []).forEach((f) => {
+      count += 1;
+      bytes += Number(f.bytes) || 0;
+    });
+    pages += 1;
+    if (!json.has_more || !json.last_id) break;
+    if (pages >= 10) { partial = true; break; }
+    after = json.last_id;
+  }
+
+  return { count, bytes, partial };
+}
+
+function getFileUsage(key, force) {
+  if (!key) return Promise.resolve(null);
+  if (!force && usageState.data && usageState.key === key
+    && Date.now() - usageState.at < USAGE_TTL) {
+    return Promise.resolve(usageState.data);
+  }
+  if (usageState.promise) return usageState.promise;
+
+  usageState.promise = fetchFileUsage(key)
+    .then((data) => {
+      usageState.at = Date.now();
+      usageState.key = key;
+      usageState.data = data;
+      usageState.promise = null;
+      return data;
+    })
+    .catch((err) => {
+      usageState.promise = null;
+      throw err;
+    });
+  return usageState.promise;
+}
+
+function renderUsage(status, data, message) {
+  const card = $('#usageCard');
+  const pctEl = $('#usagePct');
+  const fill = $('#usageFill');
+  const countEl = $('#usageCount');
+  const bytesEl = $('#usageBytes');
+  const tip = $('#usageTip');
+  if (!card || !pctEl) return;
+
+  card.classList.remove('warn', 'full');
+
+  if (status === 'loading') {
+    pctEl.textContent = '…';
+    fill.style.width = '0%';
+    countEl.textContent = '—';
+    bytesEl.textContent = '—';
+    tip.textContent = '正在读取账号里的文件用量…';
+    return;
+  }
+
+  if (status === 'empty') {
+    pctEl.textContent = '—';
+    fill.style.width = '0%';
+    countEl.textContent = '—';
+    bytesEl.textContent = '—';
+    tip.textContent = '填写 API Key 后显示用量';
+    return;
+  }
+
+  if (status === 'error') {
+    pctEl.textContent = '—';
+    fill.style.width = '0%';
+    countEl.textContent = '—';
+    bytesEl.textContent = '—';
+    tip.textContent = '读取失败：' + (message || '请稍后重试');
+    return;
+  }
+
+  const pct = usagePercent(data);
+  pctEl.textContent = pct + '%';
+  fill.style.width = pct + '%';
+  countEl.textContent = data.partial ? '10,000+' : Number(data.count).toLocaleString('en-US');
+  bytesEl.textContent = formatBytes(data.bytes);
+
+  const notes = [];
+  if (pct >= 80) {
+    card.classList.add(pct >= 100 ? 'full' : 'warn');
+    notes.push(pct >= 100
+      ? '配额已满，新的上传会失败，需要先在 DeepSeek 账号里删掉一些文件。'
+      : '接近配额上限，仍可继续上传；空间不足时再清理，删除会让引用它的历史对话失效。');
+  } else {
+    notes.push('空间充裕，文件默认永久有效，历史对话可以一直引用。');
+  }
+  if (data.partial) notes.push('（只统计了最近 10,000 个文件）');
+  tip.textContent = notes.join('');
+}
+
+async function refreshUsage(force) {
+  const input = $('#setApiKey');
+  const key = (input && input.value.trim()) || state.settings.apiKey;
+  if (!key) {
+    renderUsage('empty');
+    return;
+  }
+  if (!force && usageState.data && usageState.key === key
+    && Date.now() - usageState.at < USAGE_TTL) {
+    renderUsage('ok', usageState.data);
+    return;
+  }
+
+  renderUsage('loading');
+  try {
+    const data = await getFileUsage(key, Boolean(force));
+    if (data) renderUsage('ok', data);
+    else renderUsage('empty');
+  } catch (err) {
+    renderUsage('error', null, err.message || '读取失败');
+  }
+}
+
+function checkUsageAfterUpload() {
+  if (usageState.warned || !usageState.data) return;
+  const pct = usagePercent(usageState.data);
+  if (pct < 80) return;
+  usageState.warned = true;
+  toast('文件存储已用 ' + pct + '%，接近 DeepSeek 配额上限', 4200);
+}
+
+async function addFiles(fileList) {
+  const files = Array.from(fileList || []);
+  if (!files.length) return;
+  if (!state.settings.apiKey) {
+    openSettings(true);
+    toast('请先填写 DeepSeek API Key');
+    return;
+  }
+
+  let room = ATTACH_MAX - state.attachments.length;
+  let full = false;
+  files.forEach((file) => {
+    if (room <= 0) {
+      if (!full) toast('每条消息最多 ' + ATTACH_MAX + ' 个文件');
+      full = true;
+      return;
+    }
+    const spec = attachSpec(file.name);
+    if (!spec) {
+      toast('不支持的文件类型：' + file.name, 3200);
+      return;
+    }
+    if (file.size > spec.max) {
+      toast(file.name + ' 超过 ' + formatBytes(spec.max) + ' 上限', 3200);
+      return;
+    }
+    if (new TextEncoder().encode(file.name).length > 512) {
+      toast('文件名过长：' + String(file.name).slice(0, 18), 3200);
+      return;
+    }
+    room -= 1;
+    const item = newAttachment(file, spec);
+    state.attachments.push(item);
+    renderAttachments();
+    uploadOne(item, file);
+  });
+
+  persistDraft();
+  updateSendState();
+}
+
+async function uploadOne(item, file) {
+  try {
+    const obj = await uploadAttachment(item, file);
+    item.id = obj.id;
+    item.status = 'ready';
+    item.progress = 100;
+    if (obj.bytes) item.size = obj.bytes;
+  } catch (err) {
+    item.status = 'error';
+    item.error = err.message || '上传失败';
+  }
+  item.xhr = null;
+  paintAttachment(item);
+  updateSendState();
+  persistDraft();
+  if (item.status === 'ready') checkUsageAfterUpload();
+  if (item.status === 'error' && !item.cancelled) toast(item.name + ' ' + item.error, 3800);
+}
+
+function attachmentThumb(item) {
+  const thumb = document.createElement('span');
+  thumb.className = 'ac-thumb';
+  if (item.kind === 'image' && item.url) {
+    const img = document.createElement('img');
+    img.src = item.url;
+    img.alt = '';
+    thumb.appendChild(img);
+  } else {
+    thumb.innerHTML = ICON_FILE;
+  }
+  return thumb;
+}
+
+function attachmentChip(item, removable) {
+  const root = document.createElement('div');
+  root.className = 'attach-chip';
+  const stateText = document.createElement('span');
+  stateText.className = 'ac-state';
+
+  const info = document.createElement('span');
+  info.className = 'ac-info';
+  const name = document.createElement('span');
+  name.className = 'ac-name';
+  name.textContent = item.name;
+  name.title = item.name;
+  info.append(name, stateText);
+
+  const bar = document.createElement('span');
+  bar.className = 'ac-bar';
+  const barFill = document.createElement('i');
+  bar.appendChild(barFill);
+
+  root.append(attachmentThumb(item), info, bar);
+  if (removable !== false) {
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'ac-del';
+    del.setAttribute('aria-label', '移除');
+    del.innerHTML = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>';
+    del.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      removeAttachment(item);
+    });
+    root.appendChild(del);
+  }
+
+  item._el = { root, stateText, barFill };
+  paintAttachment(item);
+  return root;
+}
+
+function paintAttachment(item) {
+  const el = item._el;
+  if (!el) return;
+  el.root.classList.toggle('error', item.status === 'error');
+  el.root.classList.toggle('busy', item.status === 'uploading' || item.status === 'parsing');
+  el.stateText.textContent = uploadStateText(item);
+  const showBar = item.status === 'uploading' || item.status === 'parsing';
+  el.barFill.style.width = item.status === 'parsing' ? '100%' : (item.progress || 0) + '%';
+  el.barFill.parentNode.classList.toggle('show', showBar);
+  el.barFill.classList.toggle('indeterminate', item.status === 'parsing');
+}
+
+function renderAttachments() {
+  const strip = $('#attachStrip');
+  if (!strip) return;
+  strip.innerHTML = '';
+  strip.hidden = !state.attachments.length;
+  state.attachments.forEach((item) => strip.appendChild(attachmentChip(item, true)));
+  autoGrow();
+}
+
+function removeAttachment(item) {
+  const idx = state.attachments.indexOf(item);
+  if (idx < 0) return;
+  state.attachments.splice(idx, 1);
+  stopUpload(item);
+  if (item.url) URL.revokeObjectURL(item.url);
+  if (item.id) deleteRemoteFile(item.id);
+  renderAttachments();
+  updateSendState();
+  persistDraft();
+}
+
+function clearAttachments(remote) {
+  state.attachments.forEach((item) => {
+    stopUpload(item);
+    if (item.url) URL.revokeObjectURL(item.url);
+    if (remote && item.id) deleteRemoteFile(item.id);
+  });
+  state.attachments = [];
+  renderAttachments();
+  updateSendState();
+}
+
+function stopUpload(item) {
+  item.cancelled = true;
+  if (!item.xhr) return;
+  try { item.xhr.abort(); } catch {}
+  item.xhr = null;
+}
+
+function messageFilesNode(files) {
+  const box = document.createElement('div');
+  box.className = 'attach-strip in-msg';
+  files.forEach((f) => {
+    const spec = attachSpec(f.name);
+    box.appendChild(attachmentChip({
+      name: f.name,
+      size: f.size,
+      kind: f.kind || (spec ? spec.kind : 'data'),
+      status: 'ready',
+      progress: 100,
+      id: f.id,
+      error: '',
+      url: '',
+    }, false));
+  });
+  return box;
+}
+
+function apiContent(m) {
+  const files = m.files || [];
+  if (!files.length) return m.content;
+  const blocks = [];
+  if (m.content) blocks.push({ type: 'text', text: m.content });
+  files.forEach((f) => {
+    if (f.id) blocks.push({ type: 'file', file_id: f.id });
+  });
+  return blocks.length ? blocks : (m.content || '');
 }
 
 /* ============================================================
@@ -580,6 +1074,7 @@ function hashMessages() {
   const s = state.messages
     .filter((m) => !m.error)
     .map((m) => m.role + '\u0001' + (m.content || '') + '\u0001' + (m.reasoning || '')
+      + '\u0001' + ((m.files || []).map((f) => f.id).join(','))
       + '\u0001' + ((m.sources || []).map((x) => x.url).join(',')))
     .join('\u0002');
   let h = 5381;
@@ -588,7 +1083,7 @@ function hashMessages() {
 }
 
 function isDirty() {
-  return state.messages.some((m) => m.role === 'user' && m.content)
+  return state.messages.some((m) => m.role === 'user' && (m.content || (m.files && m.files.length)))
     && hashMessages() !== state.current.savedHash;
 }
 
@@ -623,8 +1118,54 @@ async function flushSave() {
   await enqueueSave({});
 }
 
+function chatData(title, createdAt, id) {
+  return {
+    id: id || '',
+    title,
+    model: state.model,
+    thinking: state.thinking,
+    effort: state.effort,
+    createdAt: new Date(createdAt).toISOString(),
+    updatedAt: new Date().toISOString(),
+    messages: state.messages
+      .filter((m) => !m.error && (m.content || m.reasoning
+        || (m.sources && m.sources.length) || (m.files && m.files.length)))
+      .map((m) => {
+        const out = { role: m.role, content: m.content, time: new Date(m.time || Date.now()).toISOString() };
+        if (m.reasoning) out.reasoning = m.reasoning;
+        if (m.reasoning && m.thinkMs) out.thinkMs = m.thinkMs;
+        if (m.search) out.search = true;
+        if (m.sources && m.sources.length) out.sources = m.sources;
+        if (m.files && m.files.length) {
+          out.files = m.files.map((f) => ({
+            id: f.id, name: f.name, size: f.size, kind: f.kind, purpose: f.purpose,
+          }));
+        }
+        return out;
+      }),
+  };
+}
+
+async function putNewChatFile(text, createdAt, title) {
+  const base = joinPath(ghDir(), makeFileName(createdAt, title));
+  let attempt = 0;
+  for (;;) {
+    const candidate = attempt === 0 ? base : base.replace(/\.json$/, '_' + attempt + '.json');
+    try {
+      const sha = await ghPut(candidate, text, 'chat: ' + title, null);
+      return { path: candidate, sha };
+    } catch (err) {
+      if ((err.status === 422 || err.status === 409) && attempt < 6) {
+        attempt += 1;
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 async function doSave() {
-  if (!state.messages.some((m) => m.role === 'user' && m.content)) return;
+  if (!state.messages.some((m) => m.role === 'user' && (m.content || (m.files && m.files.length)))) return;
   if (!ghReady()) {
     setSaveState('local');
     return;
@@ -650,44 +1191,12 @@ async function doSave() {
     }
     if (sid !== state.sid) return;
 
-    const data = {
-      id: path,
-      title,
-      model: state.model,
-      thinking: state.thinking,
-      effort: state.effort,
-      createdAt: new Date(createdAt).toISOString(),
-      updatedAt: new Date().toISOString(),
-      messages: state.messages
-        .filter((m) => !m.error && (m.content || m.reasoning || (m.sources && m.sources.length)))
-        .map((m) => {
-          const out = { role: m.role, content: m.content, time: new Date(m.time || Date.now()).toISOString() };
-          if (m.reasoning) out.reasoning = m.reasoning;
-          if (m.reasoning && m.thinkMs) out.thinkMs = m.thinkMs;
-          if (m.search) out.search = true;
-          if (m.sources && m.sources.length) out.sources = m.sources;
-          return out;
-        }),
-    };
-    const text = JSON.stringify(data, null, 2) + '\n';
+    const text = JSON.stringify(chatData(title, createdAt, path), null, 2) + '\n';
 
     if (!path) {
-      const base = joinPath(ghDir(), makeFileName(createdAt, title));
-      let attempt = 0;
-      for (;;) {
-        const candidate = attempt === 0 ? base : base.replace(/\.json$/, '_' + attempt + '.json');
-        try {
-          sha = await ghPut(candidate, text, 'chat: ' + title, null);
-          path = candidate;
-          break;
-        } catch (err) {
-          if ((err.status === 422 || err.status === 409) && attempt < 6) {
-            attempt += 1;
-            continue;
-          }
-          throw err;
-        }
-      }
+      const created = await putNewChatFile(text, createdAt, title);
+      path = created.path;
+      sha = created.sha;
     } else {
       try {
         sha = await ghPut(path, text, 'chat: ' + title, sha);
@@ -726,11 +1235,140 @@ function upsertList(item) {
 }
 
 /* ============================================================
+ * 重命名对话
+ * ============================================================ */
+
+let renaming = false;
+
+function cleanUserTitle(raw) {
+  const t = String(raw || '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/[\\/:*?"<>|]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^[._-]+|[._-]+$/g, '');
+  const chars = Array.from(t);
+  return chars.slice(0, 24).join('');
+}
+
+function startRename() {
+  if (renaming) return;
+  if (state.streaming) {
+    toast('正在生成回复，稍后再改标题', 2200);
+    return;
+  }
+  const input = $('#titleInput');
+  if (!input) return;
+  renaming = true;
+  input.value = state.current.title || '新对话';
+  $('#btnRename').hidden = true;
+  input.hidden = false;
+  input.focus();
+  input.select();
+}
+
+function finishRename(commit) {
+  if (!renaming) return;
+  renaming = false;
+  const input = $('#titleInput');
+  const value = input ? input.value : '';
+  if (input) input.hidden = true;
+  const btn = $('#btnRename');
+  if (btn) btn.hidden = false;
+  if (commit) commitRename(value);
+  else $('#chatTitle').textContent = state.current.title || '新对话';
+}
+
+let renameTask = Promise.resolve();
+
+function commitRename(raw) {
+  renameTask = renameTask.then(() => performRename(raw)).catch((err) => {
+    console.warn('[rename]', err);
+  });
+  return renameTask;
+}
+
+async function performRename(raw) {
+  const title = cleanUserTitle(raw);
+  const prevTitle = state.current.title;
+
+  if (!title || title === prevTitle) {
+    $('#chatTitle').textContent = prevTitle || '新对话';
+    if (!title && prevTitle) toast('标题不能为空', 2200);
+    return;
+  }
+
+  state.current.title = title;
+  $('#chatTitle').textContent = title;
+  const hasUserMsg = state.messages.some((m) => m.role === 'user'
+    && (m.content || (m.files && m.files.length)));
+
+  if (!hasUserMsg) {
+    persistDraft();
+    return;
+  }
+  if (!ghReady()) {
+    persistDraft();
+    setSaveState('local');
+    toast('标题已改，配置 GitHub 后会一起同步', 2600);
+    return;
+  }
+
+  // 还没生成文件的新对话：直接用新标题走首次保存
+  if (!state.current.path) {
+    setSaveState('dirty');
+    await enqueueSave({});
+    return;
+  }
+
+  const sid = state.sid;
+  const oldPath = state.current.path;
+  const oldSha = state.current.sha;
+  const createdAt = state.current.createdAt || Date.now();
+  setSaveState('saving');
+
+  try {
+    const text = JSON.stringify(chatData(title, createdAt, oldPath), null, 2) + '\n';
+    const created = await putNewChatFile(text, createdAt, title);
+    if (sid !== state.sid) return;
+
+    let deleteFailed = false;
+    try {
+      await ghDelete(oldPath, oldSha);
+    } catch (err) {
+      console.warn('[rename] 旧文件删除失败', err);
+      deleteFailed = true;
+    }
+
+    const hash = hashMessages();
+    state.current = {
+      path: created.path,
+      sha: created.sha,
+      title,
+      createdAt,
+      savedHash: hash,
+    };
+    state.list = state.list.filter((i) => i.path !== oldPath);
+    upsertList({ path: created.path, sha: created.sha, title, time: createdAt });
+    persistDraft();
+    setSaveState('saved');
+    toast(deleteFailed ? '标题已更新，但旧文件删除失败，可在侧边栏手动删除' : '标题已更新',
+      deleteFailed ? 4200 : 1800);
+  } catch (err) {
+    state.current.title = prevTitle;
+    $('#chatTitle').textContent = prevTitle || '新对话';
+    setSaveState('error');
+    toast('重命名失败：' + err.message, 4200);
+  }
+}
+
+/* ============================================================
  * 草稿（本地兜底）
  * ============================================================ */
 
 function persistDraft() {
-  if (!state.messages.length) {
+  if (!state.messages.length && !state.attachments.some((a) => a.status === 'ready')
+    && !state.current.title) {
     localStorage.removeItem(LS.draft);
     return;
   }
@@ -743,18 +1381,34 @@ function persistDraft() {
       effort: state.effort,
       current: state.current,
       messages: state.messages,
+      attachments: state.attachments
+        .filter((a) => a.status === 'ready' && a.id)
+        .map((a) => ({
+          key: a.key, name: a.name, size: a.size, kind: a.kind,
+          purpose: a.purpose, id: a.id, status: 'ready', progress: 100, error: '', url: '',
+        })),
     }));
   } catch {}
 }
 
 function restoreDraft() {
   const d = readJSON(LS.draft, null);
-  if (!d || !Array.isArray(d.messages) || !d.messages.length) return false;
+  if (!d) return false;
+  const hasMessages = Array.isArray(d.messages) && d.messages.length > 0;
+  const hasFiles = Array.isArray(d.attachments) && d.attachments.length > 0;
+  const hasTitle = Boolean(d.current && d.current.title);
+  if (!hasMessages && !hasFiles && !hasTitle) return false;
   if (Date.now() - (d.at || 0) > 1000 * 60 * 60 * 24 * 30) return false;
-  state.messages = d.messages;
+  state.messages = hasMessages ? d.messages : [];
   state.thinking = Boolean(d.thinking) || d.model === 'deepseek-reasoner';
   if (EFFORTS.indexOf(d.effort) >= 0) state.effort = d.effort;
   state.current = Object.assign({ path: '', sha: '', title: '', createdAt: 0, savedHash: '' }, d.current || {});
+  state.attachments = Array.isArray(d.attachments)
+    ? d.attachments.filter((a) => a && a.id).map((a) => Object.assign({}, a, {
+      status: 'ready', progress: 100, error: '', url: '',
+    }))
+    : [];
+  renderAttachments();
   return true;
 }
 
@@ -807,8 +1461,14 @@ function userNode(msg) {
   const wrap = document.createElement('div');
   wrap.className = 'msg user';
   const bubble = document.createElement('div');
-  bubble.className = 'bubble';
-  bubble.textContent = msg.content || '';
+  bubble.className = 'bubble' + (msg.content ? '' : ' files-only');
+  if (msg.content) {
+    const text = document.createElement('div');
+    text.className = 'bubble-text';
+    text.textContent = msg.content;
+    bubble.appendChild(text);
+  }
+  if (msg.files && msg.files.length) bubble.appendChild(messageFilesNode(msg.files));
   const actions = document.createElement('div');
   actions.className = 'msg-actions';
   addAct(actions, '复制', () => copyText(msg.content));
@@ -973,8 +1633,9 @@ function autoGrow() {
 function updateSendState() {
   const btn = $('#btnSend');
   const hasText = $('#input').value.trim().length > 0;
+  const hasFiles = state.attachments.some((a) => a.status === 'ready');
   btn.classList.toggle('streaming', state.streaming);
-  btn.disabled = state.streaming ? false : !hasText;
+  btn.disabled = state.streaming ? false : (!hasText && !hasFiles);
   btn.setAttribute('aria-label', state.streaming ? '停止生成' : '发送');
 }
 
@@ -989,16 +1650,27 @@ async function send(text) {
   if (state.streaming) return;
   const input = $('#input');
   const content = (text != null ? text : input.value).trim();
-  if (!content) return;
+  const files = state.attachments
+    .filter((a) => a.status === 'ready' && a.id)
+    .map((a) => ({ id: a.id, name: a.name, size: a.size, kind: a.kind, purpose: a.purpose }));
+  if (!content && !files.length) return;
   if (!state.settings.apiKey) {
     openSettings(true);
     toast('请先填写 DeepSeek API Key');
     return;
   }
+  if (state.attachments.some((a) => a.status === 'uploading' || a.status === 'parsing')) {
+    toast('文件还在上传中，请稍候');
+    return;
+  }
 
-  state.messages.push({ role: 'user', content, time: Date.now() });
+  const userMsg = { role: 'user', content, time: Date.now() };
+  if (files.length) userMsg.files = files;
+  state.messages.push(userMsg);
   input.value = '';
   autoGrow();
+  // 文件已随消息发送，保留在服务端；只清空输入区的待发送列表
+  clearAttachments(false);
   updateSendState();
 
   if (state.messages.length === 1) {
@@ -1059,11 +1731,11 @@ async function runCompletion() {
   try {
     let apiBody = apiMessages();
 
-    if (useSearch) {
+    const searchQuery = lastUserText();
+    if (useSearch && searchQuery) {
       let sources = [];
       try {
-        const q = lastUserText();
-        sources = await searchWeb(q, q);
+        sources = await searchWeb(searchQuery, searchQuery);
       } catch (err) {
         msg.searchError = err.message || '搜索失败';
       }
@@ -1072,6 +1744,13 @@ async function runCompletion() {
       renderSources(ref.sourcesHost, msg);
       if (!msg.content) ref.md.innerHTML = '<div class="typing"><i></i><i></i><i></i></div>';
       if (sources.length) apiBody = [searchSystemMessage(sources)].concat(apiBody);
+      scrollToBottom();
+    } else if (useSearch) {
+      // 只发了文件没有文字，没有可搜索的关键词
+      msg.search = false;
+      msg.searching = false;
+      renderSources(ref.sourcesHost, msg);
+      if (!msg.content) ref.md.innerHTML = '<div class="typing"><i></i><i></i><i></i></div>';
       scrollToBottom();
     }
 
@@ -1239,6 +1918,8 @@ async function loadList(opts) {
 
 function resetChat() {
   state.sid += 1;
+  if (renaming) finishRename(false);
+  clearAttachments(true);
   state.messages = [];
   state.searchOn = false;
   state.thinking = false;
@@ -1253,6 +1934,7 @@ function resetChat() {
 
 async function newChat() {
   if (state.streaming) stopStream();
+  await renameTask;
   await flushSave();
   resetChat();
   closeSidebar();
@@ -1264,7 +1946,10 @@ async function openConv(item) {
   if (state.streaming) stopStream();
   if (item.path === state.current.path) return;
 
+  await renameTask;
   await flushSave();
+  if (renaming) finishRename(false);
+  clearAttachments(true);
   const sid = ++state.sid;
   const chat = $('#chat');
   chat.innerHTML = '<div class="sb-empty" style="margin:auto">加载中…</div>';
@@ -1301,7 +1986,12 @@ async function openConv(item) {
 async function deleteConv(item, ev) {
   ev.stopPropagation();
   if (!ghReady()) return;
-  if (!window.confirm('删除「' + item.title + '」？文件会从 GitHub 仓库中移除。')) return;
+  const ok = await askConfirm(
+    '删除这个对话？',
+    '「' + item.title + '」的记录文件会从 GitHub 仓库移除，无法恢复。',
+    '删除'
+  );
+  if (!ok) return;
   try {
     await ghDelete(item.path, item.sha);
     state.list = state.list.filter((i) => i.path !== item.path);
@@ -1312,6 +2002,39 @@ async function deleteConv(item, ev) {
   } catch (err) {
     toast('删除失败：' + err.message, 4200);
   }
+}
+
+/* ============================================================
+ * 二次确认
+ * ============================================================ */
+
+let confirmResolve = null;
+
+function askConfirm(title, message, okText) {
+  const modal = $('#confirmModal');
+  if (!modal) return Promise.resolve(false);
+  if (confirmResolve) {
+    const prev = confirmResolve;
+    confirmResolve = null;
+    prev(false);
+  }
+  $('#confirmTitle').textContent = title || '确认操作';
+  $('#confirmText').textContent = message || '';
+  $('#btnConfirmOk').textContent = okText || '确定';
+  modal.classList.add('show');
+  setTimeout(() => {
+    const cancel = $('#btnConfirmCancel');
+    if (cancel) cancel.focus();
+  }, 40);
+  return new Promise((resolve) => { confirmResolve = resolve; });
+}
+
+function closeConfirm(ok) {
+  const modal = $('#confirmModal');
+  if (modal) modal.classList.remove('show');
+  const fn = confirmResolve;
+  confirmResolve = null;
+  if (fn) fn(Boolean(ok));
 }
 
 /* ============================================================
@@ -1333,6 +2056,7 @@ function openSettings(firstRun) {
     ? '填写自己的 API Key 与 GitHub 仓库，对话就会自动存进你的 repo'
     : '对话自动保存到你的 GitHub 仓库';
   $('#settingsModal').classList.add('show');
+  refreshUsage(false);
 }
 
 function closeSettings() {
@@ -1424,13 +2148,36 @@ function bind() {
     loadList({ silent: true });
     renderChat();
     if (isDirty()) scheduleSave(300);
+    refreshUsage(false);
     toast('设置已保存');
   });
   $('#btnTest').addEventListener('click', testConnections);
+  $('#btnUsageRefresh').addEventListener('click', () => refreshUsage(true));
   $('#searchInput').addEventListener('input', renderList);
+
+  $('#btnRename').addEventListener('click', startRename);
+  const titleInput = $('#titleInput');
+  titleInput.addEventListener('keydown', (ev) => {
+    if (ev.isComposing) return;
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      finishRename(true);
+    } else if (ev.key === 'Escape') {
+      ev.preventDefault();
+      ev.stopPropagation();
+      finishRename(false);
+    }
+  });
+  titleInput.addEventListener('blur', () => finishRename(true));
 
   $('#settingsModal').addEventListener('click', (ev) => {
     if (ev.target === $('#settingsModal')) closeSettings();
+  });
+
+  $('#btnConfirmCancel').addEventListener('click', () => closeConfirm(false));
+  $('#btnConfirmOk').addEventListener('click', () => closeConfirm(true));
+  $('#confirmModal').addEventListener('click', (ev) => {
+    if (ev.target === $('#confirmModal')) closeConfirm(false);
   });
 
   $('#btnThink').addEventListener('click', toggleThink);
@@ -1449,6 +2196,12 @@ function bind() {
   $('#btnSend').addEventListener('click', () => {
     if (state.streaming) stopStream();
     else send();
+  });
+
+  $('#btnAttach').addEventListener('click', () => $('#fileInput').click());
+  $('#fileInput').addEventListener('change', (ev) => {
+    addFiles(ev.target.files);
+    ev.target.value = '';
   });
 
   const input = $('#input');
@@ -1471,11 +2224,14 @@ function bind() {
   });
 
   document.addEventListener('keydown', (ev) => {
-    if (ev.key === 'Escape') {
-      closeSettings();
-      closeSidebar();
-      closeEffortMenu();
+    if (ev.key !== 'Escape') return;
+    if ($('#confirmModal').classList.contains('show')) {
+      closeConfirm(false);
+      return;
     }
+    closeSettings();
+    closeSidebar();
+    closeEffortMenu();
   });
 
   window.addEventListener('pagehide', () => {

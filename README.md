@@ -8,16 +8,18 @@
 
 - 参考 DeepSeek 官方 chat-demo 的界面：桌面常驻侧边栏（可收起）、移动端抽屉、居中的对话栏、卡片式输入框
 - 输入框内只有 `DeepThink` / `Search` 两个开关，模型固定 `deepseek-flash`
-- **DeepThink**：通过 `thinking: { type: "enabled" }` 开启思考，右侧可选 `reasoning_effort`：Low / High / Max（默认 High，每次开启都重置为 High）；思考过程实时展开、结束后折叠并显示耗时
+- **DeepThink**：默认关闭（省 Token），通过 `thinking: { type: "enabled" }` + `reasoning_effort` 控制，右侧可选 Low / High / Max（默认 High，每次开启都重置为 High）；关闭时同时发 `thinking: disabled` 与 `reasoning_effort: "none"`（该参数默认 high 会重新打开思考，只发 disabled 不够）；思考过程实时展开、结束后折叠并显示耗时
 - **Search**：先联网检索再把网页摘要作为上下文交给模型，回答带 [1] 引用，消息上方可展开查看来源
+- **文件上传**：输入框回车键旁的回形针按钮，可一次选多个文件；上传后可单独删除，发送时以 `file` 内容块把 `file_id` 关联进对话，直接提问分析
 - 搜索走 DeepSeek 官方接口 `POST /v1/tools/search`，与聊天共用一个 API Key
-- **两个开关默认关闭**，新建对话时复位；标题总结不开启思考，由 Flash 直接生成
+- **两个开关默认关闭**，新建对话复位；历史对话按保存时的开关状态恢复；标题总结不开启思考，由 Flash 直接生成
 - SSE 流式输出，可中途停止、可重新生成
 - 每轮对话结束后自动保存：
   1. 调用模型总结不超过 12 字的标题
   2. 文件名 = `时间_标题.json`，例如 `2026-11-18_165012_浏览器流式输出.json`
   3. 通过 GitHub Contents API 提交到仓库指定目录
 - 历史列表通过 GitHub **git tree API**（`GET /repos/{owner}/{repo}/git/trees/{branch}?recursive=1`）读取文件名生成，按时间倒序、按月分组
+- **标题可改**：点顶部标题进入编辑（Enter 保存、Esc 取消、焦点移走也会保存），自动生成的标题不合题意时直接改
 - 未配置 GitHub 时，对话暂存在浏览器本地，不会丢
 - 支持深色 / 浅色 / 跟随系统
 
@@ -35,6 +37,24 @@ Authorization: Bearer <同一个 DeepSeek API Key>
 - 消息上方可展开「搜索到 N 个网页」，列表来自返回的 `title` / `site_name` / `url`
 - 搜索失败或无结果时会提示并直接回答，不会中断对话
 - 该接口按次计费，具体见官方指南 <https://api-docs.deepseek.com/zh-cn/guides/search>
+
+## 文件上传
+
+点击输入框左下角的回形针（回车键旁边）选择文件，也可以直接多选。上传时按扩展名选择 Files API 的 `purpose`：
+
+| 类型 | 扩展名 | purpose | 单文件上限 |
+| --- | --- | --- | --- |
+| 图片 | jpg / jpeg / png / gif / webp | `user_data` | 64 MiB |
+| 文档 | pdf / doc / docx / ppt / pptx | `rich_layout_recognition` | 100 MiB |
+| 文本、表格、电子书 | txt / md / csv / json / 代码，xlsx / xls，epub / mobi | `user_data` | 32 MiB |
+
+- 表单里 `purpose` 排在 `file` 之前（文档解析要求），上传用 XHR 展示百分比，文档解析期间显示「解析中…」
+- 发送时把每个文件以 `{"type":"file","file_id":"file-api-..."}` 放进用户消息的 `content` 数组，与文字一起提交
+- 点附件右侧的 × 移除：未发送的文件会同时调用 `DELETE /files/{file_id}`，不在账号里留垃圾；已发送的消息只做展示
+- 每条消息最多 20 个文件（与「每个请求最多引用 20 个文档」一致），上传中不能发送
+- 文件与 API Key 属于同一账号，默认不设有效期，历史对话重新打开后仍能引用；在 DeepSeek 账号里删除该文件后，旧对话再提问会返回 400
+- 文档解析按页计费、对话引用按输入 Token 计费，见官方 [Files API](https://api-docs.deepseek.com/zh-cn/guides/files_api) 与 [文件解析](https://api-docs.deepseek.com/zh-cn/guides/document_parsing)
+- 设置里的「文件存储」显示账号已用空间与文件数（`GET /files` 分页统计，10 分钟缓存，可手动刷新），超过 80% 标黄，上传成功后提醒一次；只做提示，不提供清理入口，避免误删导致历史对话失效
 
 ## 快速开始
 
@@ -100,9 +120,10 @@ python3 -m http.server 8080
 
 - `thinking` / `effort` 是整个对话的思考设置，打开历史对话时会一并恢复
 - `sources` / `search` 只在开启 Search 的回复里出现
-- 标题只在首次保存时生成一次，之后续聊沿用文件名，不会重命名
+- 带附件的用户消息多一个 `files` 字段：`[{ "id": "file-api-…", "name": "report.pdf", "size": 1234, "kind": "doc", "purpose": "rich_layout_recognition" }]`，重新打开对话时用它还原附件并继续提问
+- 标题只在首次保存时生成一次；手动改标题会按新标题写一个新文件（`时间_新标题.json` 并带上当前全部消息），成功后删除旧文件，所以文件名始终等于列表标题；新标题也会写回 JSON 的 `title`
 - 同一秒内重名会自动加 `_1`、`_2` 后缀
-- 在侧边栏（手机为抽屉）里点垃圾桶可从仓库删除该文件
+- 在侧边栏（手机为抽屉）里点垃圾桶会先弹出自定义确认框（默认焦点在「取消」，Esc / 点遮罩也可取消），确认后才从仓库删除，删除不可恢复
 
 ## 文件结构
 
