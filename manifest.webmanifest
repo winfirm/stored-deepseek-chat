@@ -1,5 +1,5 @@
 {
-  "name": "DeepSeek Chat",
+  "name": "Stored DeepSeek Chat",
   "short_name": "DS Chat",
   "description": "用自己的 DeepSeek API 聊天，记录保存到 GitHub 仓库",
   "start_url": "./index.html",
