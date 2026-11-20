@@ -76,7 +76,8 @@ python3 -m http.server 8080
 2. 创建 Fine-grained token：GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens
    - Repository access：只勾选这个仓库
    - Permissions → Repository permissions → **Contents: Read and write**
-3. 在设置里填入 Token、用户名/组织、仓库名、分支、目录（默认 `chats`）
+3. 在设置里填入 Token、用户名/组织、仓库名、分支、目录（默认 `/`，即仓库根目录）
+   - 目录支持多个，用 `,` 分隔，例如 `/,chats,test`；侧边栏列表上方会出现目录 tab，新对话存进当前 tab 对应的目录
 
 点「测试连接」确认两项都正常。
 
@@ -137,6 +138,7 @@ icon.svg / icon-180.png / icon-512.png / manifest.webmanifest   添加到主屏�
 ## 说明
 
 - DeepSeek API 与 GitHub API 都允许浏览器跨域直连，因此不需要任何代理服务
-- Markdown 渲染依赖 jsDelivr 上的 marked / DOMPurify；加载失败时退化为纯文本显示，聊天本身不受影响
+- Markdown 渲染依赖 jsDelivr 上的 marked / DOMPurify / KaTeX；加载失败时退化为纯文本显示，聊天本身不受影响
+- 数学公式支持 `$...$`、`$$...$$`、`\(...\)`、`\[...\]` 四种写法，代码块内的内容不会被当成公式
 - Search 每次会按官方计费规则消耗搜索调用次数；Key 无权限或额度不足时会提示「网页搜索暂不可用」并直接回答
 - 对话内容会以明文提交到你自己的仓库，仓库若是 Public 则所有人可见

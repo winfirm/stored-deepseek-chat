@@ -26,7 +26,7 @@ const DEFAULT_SETTINGS = {
   ghOwner: '',
   ghRepo: '',
   ghBranch: 'main',
-  ghDir: 'chats',
+  ghDir: '/', // 逗号分隔多个目录，/ 表示仓库根目录
 };
 
 const EFFORTS = ['low', 'high', 'max'];
@@ -67,6 +67,7 @@ const state = {
   messages: [],
   current: { path: '', sha: '', title: '', createdAt: 0, savedHash: '' },
   list: [],
+  activeDir: null,
   streaming: false,
   controller: null,
   sid: 0,
@@ -177,15 +178,86 @@ if (window.marked) {
   window.marked.setOptions({ gfm: true, breaks: true });
 }
 
+/* 数学公式：先把公式抽成占位 span，等 marked / DOMPurify 处理完再用 KaTeX 排版。
+   这样 \[ \] \( \) 不会被 marked 当成转义吃掉，代码块里的 $ 也不会被误判。 */
+
+const MATH_ATTR = 'data-tex';
+const mathCache = new Map();
+
+function mathSlot(tex, display) {
+  const body = String(tex || '').trim();
+  if (!body) return '';
+  return '<span ' + MATH_ATTR + '="' + encodeURIComponent(body) + '"'
+    + (display ? ' data-math-display="1"' : '') + '></span>';
+}
+
+function protectMath(src) {
+  const codes = [];
+  let text = String(src == null ? '' : src).replace(/```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`/g, (m) => {
+    codes.push(m);
+    return '\u0000' + (codes.length - 1) + '\u0000';
+  });
+
+  text = text
+    .replace(/\\\[([\s\S]+?)\\\]/g, (m, tex) => mathSlot(tex, true))
+    .replace(/\$\$([\s\S]+?)\$\$/g, (m, tex) => mathSlot(tex, true))
+    .replace(/\\\(([\s\S]+?)\\\)/g, (m, tex) => mathSlot(tex, false))
+    .replace(/(^|[^\\$])\$([^\n$]+?)\$(?!\d)/g, (m, before, tex) => {
+      if (/^[\d.,\s]+$/.test(tex)) return m; // $12.5 and $30 这类价格不当公式
+      return before + mathSlot(tex, false);
+    });
+
+  return text.replace(/\u0000(\d+)\u0000/g, (m, i) => codes[Number(i)]);
+}
+
+function katexHTML(tex, display) {
+  const key = (display ? 'D:' : 'I:') + tex;
+  const hit = mathCache.get(key);
+  if (hit) return hit;
+  let html;
+  try {
+    html = window.katex.renderToString(tex, { displayMode: display, throwOnError: false, strict: false });
+  } catch (err) {
+    html = '<code>' + esc(tex) + '</code>';
+  }
+  if (mathCache.size > 800) mathCache.clear();
+  mathCache.set(key, html);
+  return html;
+}
+
+function typesetMath(root) {
+  if (!root) return;
+  root.querySelectorAll('[' + MATH_ATTR + ']').forEach((el) => {
+    const raw = el.getAttribute(MATH_ATTR) || '';
+    let tex = raw;
+    try { tex = decodeURIComponent(raw); } catch (err) { tex = raw; }
+    const display = el.getAttribute('data-math-display') === '1';
+    el.classList.add('math');
+    if (display) el.classList.add('math-display');
+    if (!tex) { el.remove(); return; }
+    if (!window.katex) {
+      el.textContent = (display ? '$$' : '$') + tex + (display ? '$$' : '$');
+      return;
+    }
+    el.innerHTML = katexHTML(tex, display);
+  });
+}
+
 function renderMarkdown(text) {
   if (window.marked && window.DOMPurify) {
     try {
-      return window.DOMPurify.sanitize(window.marked.parse(text), { ADD_ATTR: ['target', 'rel'] });
+      return window.DOMPurify.sanitize(window.marked.parse(protectMath(text)), { ADD_ATTR: ['target', 'rel'] });
     } catch (err) {
       console.warn('markdown 渲染失败', err);
     }
   }
   return '<p>' + esc(text).replace(/\n/g, '<br>') + '</p>';
+}
+
+function mountMarkdown(el, text) {
+  el.innerHTML = renderMarkdown(text);
+  typesetMath(el);
+  return el;
 }
 
 function decorateCode(root) {
@@ -960,8 +1032,50 @@ function encodeContentPath(path) {
   return String(path).split('/').map(encodeURIComponent).join('/');
 }
 
+/* 把输入框里的目录串规范成 "chats,notes/chats,/"，/ 代表仓库根目录 */
+function normalizeDirInput(input) {
+  const dirs = [];
+  String(input || '').split(',').forEach((part) => {
+    const raw = part.trim();
+    if (!raw) return; // 多余的逗号直接忽略
+    const dir = raw.replace(/^\/+|\/+$/g, '');
+    if (dirs.indexOf(dir) < 0) dirs.push(dir);
+  });
+  if (!dirs.length) dirs.push('');
+  return dirs.map((d) => d || '/').join(',');
+}
+
+/* 目录配置支持逗号分隔多个；空串代表仓库根目录 */
+function ghDirs() {
+  const dirs = [];
+  String(state.settings.ghDir || '').split(',').forEach((part) => {
+    const raw = part.trim();
+    if (!raw) return;
+    const dir = raw.replace(/^\/+|\/+$/g, '');
+    if (dirs.indexOf(dir) < 0) dirs.push(dir);
+  });
+  if (!dirs.length) dirs.push('');
+  return dirs;
+}
+
+/* 当前选中的目录 tab；未选择时优先落在根目录 */
 function ghDir() {
-  return String(state.settings.ghDir || '').replace(/^\/+|\/+$/g, '');
+  const dirs = ghDirs();
+  if (state.activeDir != null && dirs.indexOf(state.activeDir) >= 0) return state.activeDir;
+  return dirs.indexOf('') >= 0 ? '' : dirs[0];
+}
+
+/* 路径属于哪个已配置目录（取最长前缀，允许 chats 与 chats/2024 同时存在） */
+function dirOfPath(path) {
+  const p = String(path || '');
+  const hits = ghDirs().filter((d) => d && p.indexOf(d + '/') === 0);
+  hits.sort((a, b) => b.length - a.length);
+  if (hits.length) return hits[0];
+  return p.indexOf('/') < 0 ? '' : null;
+}
+
+function itemDir(item) {
+  return item && item.dir != null ? item.dir : dirOfPath(item && item.path);
 }
 
 function joinPath(dir, name) {
@@ -1015,16 +1129,20 @@ async function ghList() {
   const res = await gh('/repos/' + repoPath() + '/git/trees/'
     + encodeURIComponent(state.settings.ghBranch) + '?recursive=1');
   const j = await res.json();
-  const dir = ghDir();
+  const dirs = ghDirs().slice().sort((a, b) => b.length - a.length);
   const items = [];
 
   (j.tree || []).forEach((node) => {
     if (node.type !== 'blob' || !/\.json$/i.test(node.path)) return;
-    if (dir && node.path.indexOf(dir + '/') !== 0) return;
+    // 只收直接放在某个已配置目录下的文件，避免把子目录里的也算进来
+    const dir = dirs.find((d) => (d
+      ? node.path.indexOf(d + '/') === 0 && node.path.indexOf('/', d.length + 1) < 0
+      : node.path.indexOf('/') < 0));
+    if (dir === undefined) return;
     const name = dir ? node.path.slice(dir.length + 1) : node.path;
     const meta = parseFileName(name);
     if (!meta) return;
-    items.push({ path: node.path, sha: node.sha, title: meta.title, time: meta.time });
+    items.push({ path: node.path, sha: node.sha, dir, title: meta.title, time: meta.time });
   });
 
   items.sort((a, b) => b.time - a.time);
@@ -1146,8 +1264,8 @@ function chatData(title, createdAt, id) {
   };
 }
 
-async function putNewChatFile(text, createdAt, title) {
-  const base = joinPath(ghDir(), makeFileName(createdAt, title));
+async function putNewChatFile(text, createdAt, title, dir) {
+  const base = joinPath(dir == null ? ghDir() : dir, makeFileName(createdAt, title));
   let attempt = 0;
   for (;;) {
     const candidate = attempt === 0 ? base : base.replace(/\.json$/, '_' + attempt + '.json');
@@ -1329,7 +1447,7 @@ async function performRename(raw) {
 
   try {
     const text = JSON.stringify(chatData(title, createdAt, oldPath), null, 2) + '\n';
-    const created = await putNewChatFile(text, createdAt, title);
+    const created = await putNewChatFile(text, createdAt, title, itemDir({ path: oldPath }));
     if (sid !== state.sid) return;
 
     let deleteFailed = false;
@@ -1501,7 +1619,7 @@ function assistantNode(msg) {
   const md = document.createElement('div');
   md.className = 'md';
   if (msg.content) {
-    md.innerHTML = renderMarkdown(msg.content);
+    mountMarkdown(md, msg.content);
     decorateCode(md);
   } else if (msg.error) {
     md.innerHTML = '<p style="color:var(--danger)">请求失败：' + esc(msg.error) + '</p>';
@@ -1723,7 +1841,7 @@ async function runCompletion() {
       }
     }
     if (msg.content) {
-      ref.md.innerHTML = renderMarkdown(msg.content) + '<span class="cursor"></span>';
+      mountMarkdown(ref.md, msg.content).insertAdjacentHTML('beforeend', '<span class="cursor"></span>');
     }
     scrollToBottom();
   };
@@ -1778,7 +1896,7 @@ async function runCompletion() {
     if (raf) { cancelAnimationFrame(raf); paint(); }
 
     if (msg.content) {
-      ref.md.innerHTML = renderMarkdown(msg.content);
+      mountMarkdown(ref.md, msg.content);
       decorateCode(ref.md);
     } else if (msg.error) {
       ref.md.innerHTML = '<p style="color:var(--danger)">请求失败：' + esc(msg.error) + '</p>';
@@ -1836,11 +1954,42 @@ function monthLabel(t) {
   return d.getFullYear() + ' 年 ' + (d.getMonth() + 1) + ' 月';
 }
 
+function renderDirTabs() {
+  const box = $('#dirTabs');
+  if (!box) return;
+  const dirs = ghReady() ? ghDirs() : [];
+  if (!dirs.length) {
+    box.hidden = true;
+    box.innerHTML = '';
+    return;
+  }
+  box.hidden = false;
+  box.innerHTML = '';
+  // 末级目录名重复时（如 a/chats 与 b/chats）退回显示完整路径
+  const leaves = dirs.map((d) => (d ? d.split('/').pop() : '默认'));
+  dirs.forEach((dir, i) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'dir-tab' + (dir === ghDir() ? ' active' : '');
+    btn.textContent = leaves.indexOf(leaves[i]) === leaves.lastIndexOf(leaves[i]) ? leaves[i] : (dir || '/');
+    btn.title = dir || '/';
+    btn.addEventListener('click', () => {
+      if (dir === ghDir()) return;
+      state.activeDir = dir;
+      renderList();
+    });
+    box.appendChild(btn);
+  });
+}
+
 function renderList() {
   const box = $('#drawerList');
+  const dir = ghDir();
   const keyword = ($('#searchInput').value || '').trim().toLowerCase();
-  const items = state.list.filter((i) => !keyword || String(i.title).toLowerCase().indexOf(keyword) >= 0);
+  const items = state.list.filter((i) => itemDir(i) === dir
+    && (!keyword || String(i.title).toLowerCase().indexOf(keyword) >= 0));
 
+  renderDirTabs();
   box.innerHTML = '';
 
   if (!ghReady()) {
@@ -1892,8 +2041,10 @@ function renderList() {
 
 async function loadList(opts) {
   const silent = opts && opts.silent;
+  const dirs = ghDirs();
   $('#repoLabel').textContent = ghReady()
-    ? state.settings.ghOwner + '/' + state.settings.ghRepo + ' · ' + (ghDir() || '/')
+    ? state.settings.ghOwner + '/' + state.settings.ghRepo + ' · '
+      + (dirs.length > 1 ? dirs.length + ' 个目录' : (dirs[0] || '/'))
     : '未配置 GitHub';
 
   if (!ghReady()) {
@@ -2049,7 +2200,7 @@ function openSettings(firstRun) {
   $('#setGhOwner').value = s.ghOwner || '';
   $('#setGhRepo').value = s.ghRepo || '';
   $('#setGhBranch').value = s.ghBranch || 'main';
-  $('#setGhDir').value = s.ghDir || '';
+  $('#setGhDir').value = s.ghDir || '/';
   $('#setTheme').value = state.themePref;
   $('#settingsTitle').textContent = firstRun ? '开始使用' : '设置';
   $('#settingsSub').textContent = firstRun
@@ -2072,9 +2223,10 @@ function collectSettings() {
     ghOwner: $('#setGhOwner').value.trim(),
     ghRepo: $('#setGhRepo').value.trim(),
     ghBranch: $('#setGhBranch').value.trim() || 'main',
-    ghDir: $('#setGhDir').value.trim().replace(/^\/+|\/+$/g, ''),
+    ghDir: normalizeDirInput($('#setGhDir').value),
   };
   persistSettings();
+  if (ghDirs().indexOf(state.activeDir) < 0) state.activeDir = null;
   applyTheme($('#setTheme').value);
   syncToggles();
 }
@@ -2246,6 +2398,7 @@ function bind() {
 
 function init() {
   initTheme();
+  state.activeDir = ghDir(); // 初始化时聚焦根目录（没配根目录则第一个）
   bind();
   setCollapsed(localStorage.getItem(LS.collapsed) === '1');
   syncToggles();
